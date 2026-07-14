@@ -183,20 +183,41 @@
   }
   beta_columns <- match(beta_names, colnames(sumstats))
   se_columns <- match(se_names, colnames(sumstats))
-
-  # ── Initialise output data frame ──────────────────────────────────────────────
-  GLS_mGWAS_results <- sumstats[, 1:6, drop = FALSE]
-
-  for (j in factors) {
-    GLS_mGWAS_results[[paste0("beta_",   j)]] <- NA_real_
-    GLS_mGWAS_results[[paste0("SE_",     j)]] <- NA_real_
-    GLS_mGWAS_results[[paste0("Z_beta_", j)]] <- NA_real_
-    GLS_mGWAS_results[[paste0("p_val_",  j)]] <- NA_real_
+  if (backend == "rust") {
+    beta_data <- lapply(sumstats[beta_columns], function(column) {
+      if (is.double(column)) column else as.double(column)
+    })
+    se_data <- lapply(sumstats[se_columns], function(column) {
+      if (is.double(column)) column else as.double(column)
+    })
   }
 
-  GLS_mGWAS_results$Q_omnibus <- NA_real_
-  GLS_mGWAS_results$Q_omnibus_df <- NA_real_
-  GLS_mGWAS_results$Q_omnibus_pval <- NA_real_
+  # ── Preallocate numeric output ────────────────────────────────────────────────
+  # Filling a matrix avoids repeated [<-.data.frame dispatch and column copies
+  # for every batch. Metadata is joined once after all numeric results are ready.
+  factor_beta_columns <- seq.int(1L, by = 4L, length.out = num_factors)
+  factor_se_columns <- factor_beta_columns + 1L
+  factor_z_columns <- factor_beta_columns + 2L
+  factor_p_columns <- factor_beta_columns + 3L
+  q_column <- 4L * num_factors + 1L
+  q_df_column <- q_column + 1L
+  q_p_column <- q_column + 2L
+  numeric_names <- c(
+    unlist(lapply(factors, function(factor) {
+      c(
+        paste0("beta_", factor), paste0("SE_", factor),
+        paste0("Z_beta_", factor), paste0("p_val_", factor)
+      )
+    })),
+    "Q_omnibus", "Q_omnibus_df", "Q_omnibus_pval"
+  )
+  numeric_results <- matrix(
+    NA_real_,
+    nrow = nrow(sumstats),
+    ncol = length(numeric_names),
+    dimnames = list(NULL, numeric_names)
+  )
+  numeric_results[, q_df_column] <- num_traits - num_factors
 
   # ── Batch loop ────────────────────────────────────────────────────────────────
   total_batches <- ceiling(nrow(sumstats) / batch_size)
@@ -207,45 +228,59 @@
     i             <- (batch_num - 1) * batch_size + 1
     batch_end     <- min(i + batch_size - 1, nrow(sumstats))
     batch_indices <- i:batch_end
-    betas <- as.matrix(sumstats[batch_indices, beta_columns, drop = FALSE])
-    ses <- as.matrix(sumstats[batch_indices, se_columns, drop = FALSE])
-    kernel_results <- .analytic_gls_batch(
-      betas = betas,
-      ses = ses,
-      loadings = loadings,
-      corr = sampling_corr,
-      q_corr = q_corr,
-      threads = threads,
-      backend = backend
-    )
+    if (backend == "rust") {
+      kernel_results <- .analytic_gls_columns_rust(
+        betas = beta_data,
+        ses = se_data,
+        loadings = loadings,
+        corr = sampling_corr,
+        q_corr = q_corr,
+        start = i - 1L,
+        count = length(batch_indices),
+        threads = threads
+      )
+    } else {
+      betas <- as.matrix(sumstats[batch_indices, beta_columns, drop = FALSE])
+      ses <- as.matrix(sumstats[batch_indices, se_columns, drop = FALSE])
+      kernel_results <- .analytic_gls_batch(
+        betas = betas,
+        ses = ses,
+        loadings = loadings,
+        corr = sampling_corr,
+        q_corr = q_corr,
+        threads = threads,
+        backend = backend
+      )
+    }
     z_values <- kernel_results$beta / kernel_results$se
 
     # ── Write batch results ──────────────────────────────────────────────────────
-    for (factor_index in seq_along(factors)) {
-      factor_name <- factors[[factor_index]]
-      GLS_mGWAS_results[batch_indices, paste0("beta_", factor_name)] <-
-        kernel_results$beta[, factor_index]
-      GLS_mGWAS_results[batch_indices, paste0("SE_", factor_name)] <-
-        kernel_results$se[, factor_index]
-      GLS_mGWAS_results[batch_indices, paste0("Z_beta_", factor_name)] <-
-        z_values[, factor_index]
-      GLS_mGWAS_results[batch_indices, paste0("p_val_", factor_name)] <-
-        2 * stats::pnorm(-abs(z_values[, factor_index]))
-    }
-
-    GLS_mGWAS_results[batch_indices, "Q_omnibus"] <- kernel_results$q
-    GLS_mGWAS_results[batch_indices, "Q_omnibus_df"] <- num_traits - num_factors
-    GLS_mGWAS_results[batch_indices, "Q_omnibus_pval"] <- stats::pchisq(
-      GLS_mGWAS_results[batch_indices, "Q_omnibus"],
-      df = GLS_mGWAS_results[batch_indices, "Q_omnibus_df"],
+    p_values <- matrix(
+      2 * stats::pnorm(-abs(z_values)),
+      nrow = length(batch_indices),
+      ncol = num_factors
+    )
+    numeric_results[batch_indices, factor_beta_columns] <- kernel_results$beta
+    numeric_results[batch_indices, factor_se_columns] <- kernel_results$se
+    numeric_results[batch_indices, factor_z_columns] <- z_values
+    numeric_results[batch_indices, factor_p_columns] <- p_values
+    numeric_results[batch_indices, q_column] <- kernel_results$q
+    numeric_results[batch_indices, q_p_column] <- stats::pchisq(
+      kernel_results$q,
+      df = num_traits - num_factors,
       lower.tail = FALSE
     )
 
     setTxtProgressBar(pb, batch_num)
-    if (batch_num %% 10 == 0) gc()
   }
 
   close(pb)
+
+  GLS_mGWAS_results <- data.frame(
+    sumstats[, 1:6, drop = FALSE],
+    as.data.frame(numeric_results, optional = TRUE),
+    check.names = FALSE
+  )
 
   end_time     <- Sys.time()
   elapsed_time <- end_time - start_time

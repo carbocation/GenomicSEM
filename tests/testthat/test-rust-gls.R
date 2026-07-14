@@ -62,6 +62,58 @@ test_that("Rust thread counts produce deterministic results", {
   }
 })
 
+test_that("zero-copy Rust columns honor batch offsets", {
+  for (n_factors in 1:3) {
+    inputs <- make_gls_inputs(
+      n_snps = 101L, n_traits = 9L, n_factors = n_factors,
+      seed = 500L + n_factors
+    )
+    rows <- 18:70
+    beta_columns <- lapply(seq_len(ncol(inputs$betas)), function(column) {
+      inputs$betas[, column]
+    })
+    se_columns <- lapply(seq_len(ncol(inputs$ses)), function(column) {
+      inputs$ses[, column]
+    })
+    columns <- GenomicSEM:::.analytic_gls_columns_rust(
+      beta_columns, se_columns, inputs$loadings,
+      inputs$sampling_corr, inputs$q_corr,
+      start = min(rows) - 1L, count = length(rows), threads = 4L
+    )
+    matrix <- GenomicSEM:::.analytic_gls_batch_rust(
+      inputs$betas[rows, , drop = FALSE],
+      inputs$ses[rows, , drop = FALSE],
+      inputs$loadings, inputs$sampling_corr, inputs$q_corr,
+      threads = 4L
+    )
+
+    expect_identical(columns, matrix)
+  }
+})
+
+test_that("zero-copy Rust columns reject invalid row ranges", {
+  inputs <- make_gls_inputs(n_snps = 10L, n_traits = 4L, n_factors = 1L)
+  beta_columns <- as.data.frame(inputs$betas)
+  se_columns <- as.data.frame(inputs$ses)
+
+  expect_error(
+    GenomicSEM:::.analytic_gls_columns_rust(
+      beta_columns, se_columns, inputs$loadings,
+      inputs$sampling_corr, inputs$q_corr,
+      start = 8L, count = 3L
+    ),
+    "requested row range"
+  )
+  expect_error(
+    GenomicSEM:::.analytic_gls_columns_rust(
+      beta_columns, se_columns, inputs$loadings,
+      inputs$sampling_corr, inputs$q_corr,
+      start = 1.5, count = 2L
+    ),
+    "non-negative whole number"
+  )
+})
+
 test_that("two-factor specialization remains accurate for correlated loadings", {
   inputs <- make_gls_inputs(n_snps = 257L, n_traits = 10L, n_factors = 2L)
   inputs$loadings[, 2] <- inputs$loadings[, 1] +
@@ -147,6 +199,7 @@ test_that("userGWAS analytic batching preserves output", {
     SNP = paste0("rs", seq_len(211L)), CHR = 1L, BP = seq_len(211L),
     MAF = 0.2, A1 = "A", A2 = "G"
   )
+  row.names(sumstats) <- paste0("variant_", seq_len(nrow(sumstats)))
   for (trait_index in seq_along(traits)) {
     sumstats[[paste0("beta.", traits[[trait_index]])]] <-
       inputs$betas[, trait_index]
@@ -174,9 +227,42 @@ test_that("userGWAS analytic batching preserves output", {
   ))
 
   expect_identical(names(rust), names(reference))
+  expect_identical(row.names(rust), row.names(sumstats))
   expect_identical(rust[, 1:6], reference[, 1:6])
   expect_equal(rust[, 7:ncol(rust)], reference[, 7:ncol(reference)],
                tolerance = 1e-10, ignore_attr = TRUE)
+})
+
+test_that("userGWAS zero-copy input supports integer and data.table columns", {
+  inputs <- make_gls_inputs(n_snps = 43L, n_traits = 5L, n_factors = 1L)
+  traits <- paste0("T", seq_len(5L))
+  sumstats <- data.frame(
+    SNP = paste0("rs", seq_len(43L)), CHR = 1L, BP = seq_len(43L),
+    MAF = 0.2, A1 = "A", A2 = "G"
+  )
+  for (trait_index in seq_along(traits)) {
+    sumstats[[paste0("beta.", traits[[trait_index]])]] <-
+      as.integer(round(1000 * inputs$betas[, trait_index]))
+    sumstats[[paste0("se.", traits[[trait_index]])]] <-
+      as.integer(round(1000 * inputs$ses[, trait_index]))
+  }
+  ldsc <- list(S = diag(5L), I = inputs$q_corr)
+  colnames(ldsc$S) <- rownames(ldsc$S) <- traits
+  usermod <- data.frame(
+    lhs = "F1", op = "=~", rhs = traits,
+    Unstand_Est = inputs$loadings[, 1]
+  )
+
+  data_frame_result <- suppressWarnings(GenomicSEM:::.userGWASa(
+    sumstats, ldsc, model = "", usermod = usermod,
+    batch_size = 11L, cores = 2L
+  ))
+  data_table_result <- suppressWarnings(GenomicSEM:::.userGWASa(
+    data.table::as.data.table(sumstats), ldsc, model = "", usermod = usermod,
+    batch_size = 13L, cores = 2L
+  ))
+
+  expect_identical(data_table_result, data_frame_result)
 })
 
 test_that("userGWAS aligns trait columns by LDSC names", {

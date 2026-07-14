@@ -14,11 +14,19 @@ Log of version histories.
   SNP with a symmetric quadratic form instead of repeating an LU backsolve.
 - One- and two-factor models use specialized closed-form Rust kernels; models
   with more factors continue to use the generic Cholesky implementation.
+- Analytic summary-statistic columns are passed directly to Rust with batch
+  offsets, avoiding the repeated data-frame subsets and beta/SE matrix copies
+  that previously occurred for every batch.
+- Analytic result columns are filled in one preallocated numeric matrix, and
+  metadata is combined once after all batches complete.
+- Removed periodic forced garbage collections from the analytic batch loop;
+  R's allocator now collects temporary batch outputs only when needed.
 - Added an internal R reference backend for numerical comparison. It can be
   selected for diagnostics with
   `options(GenomicSEM.analytic_backend = "R")`.
-- Added Rust unit tests, R differential tests, and a reproducible benchmark in
-  `benchmarks/benchmark-rust-gls.R`.
+- Added Rust unit tests, R differential tests, and reproducible kernel and
+  end-to-end benchmarks in `benchmarks/benchmark-rust-gls.R` and
+  `benchmarks/benchmark-usergwas-analytic.R`.
 
 **0.0.1** Initial release  
 Able to perfrom all analysis in preprint

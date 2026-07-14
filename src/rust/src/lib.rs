@@ -10,12 +10,11 @@ const MIN_ROWS_PER_WORKER: usize = 256;
 
 #[derive(Clone, Copy)]
 struct Inputs<'a> {
-    betas: &'a [f64],
-    ses: &'a [f64],
+    betas: &'a [&'a [f64]],
+    ses: &'a [&'a [f64]],
     loadings: &'a [f64],
     corr: &'a [f64],
     q_inverse: &'a [f64],
-    n: usize,
     traits: usize,
     factors: usize,
 }
@@ -90,7 +89,7 @@ fn cholesky_solve(chol: &[f64], values: &mut [f64], size: usize) {
 }
 
 fn lu_in_place(matrix: &mut [f64], pivots: &mut [usize], size: usize) -> bool {
-    for col in 0..size {
+    for (col, pivot_slot) in pivots.iter_mut().enumerate().take(size) {
         let mut pivot = col;
         let mut pivot_value = matrix[col * size + col].abs();
         for row in (col + 1)..size {
@@ -103,7 +102,7 @@ fn lu_in_place(matrix: &mut [f64], pivots: &mut [usize], size: usize) -> bool {
         if !pivot_value.is_finite() || pivot_value == 0.0 {
             return false;
         }
-        pivots[col] = pivot;
+        *pivot_slot = pivot;
         if pivot != col {
             for inner_col in 0..size {
                 matrix.swap(col * size + inner_col, pivot * size + inner_col);
@@ -123,9 +122,9 @@ fn lu_in_place(matrix: &mut [f64], pivots: &mut [usize], size: usize) -> bool {
 }
 
 fn lu_solve(lu: &[f64], pivots: &[usize], values: &mut [f64], size: usize) {
-    for col in 0..size {
-        if pivots[col] != col {
-            values.swap(col, pivots[col]);
+    for (col, &pivot) in pivots.iter().enumerate().take(size) {
+        if pivot != col {
+            values.swap(col, pivot);
         }
     }
     for row in 0..size {
@@ -180,8 +179,8 @@ fn compute_row_one_factor(
     let mut rhs = 0.0;
 
     for trait_index in 0..k {
-        let beta = inputs.betas[row + inputs.n * trait_index];
-        let se = inputs.ses[row + inputs.n * trait_index];
+        let beta = inputs.betas[trait_index][row];
+        let se = inputs.ses[trait_index][row];
         let corr_diag = inputs.corr[trait_index * k + trait_index];
         let loading = inputs.loadings[trait_index];
         if !beta.is_finite()
@@ -228,8 +227,8 @@ fn compute_row_one_factor(
     se_out[0] = variance.max(0.0).sqrt();
 
     for trait_index in 0..k {
-        let beta = inputs.betas[row + inputs.n * trait_index];
-        let se = inputs.ses[row + inputs.n * trait_index];
+        let beta = inputs.betas[trait_index][row];
+        let se = inputs.ses[trait_index][row];
         scratch.residual[trait_index] = (beta - inputs.loadings[trait_index] * factor_beta) / se;
     }
     let Some(q) = symmetric_quadratic_form(inputs.q_inverse, &scratch.residual) else {
@@ -256,8 +255,8 @@ fn compute_row_two_factors(
     let mut rhs_1 = 0.0;
 
     for trait_index in 0..k {
-        let beta = inputs.betas[row + inputs.n * trait_index];
-        let se = inputs.ses[row + inputs.n * trait_index];
+        let beta = inputs.betas[trait_index][row];
+        let se = inputs.ses[trait_index][row];
         let corr_diag = inputs.corr[trait_index * k + trait_index];
         let loading_0 = inputs.loadings[trait_index];
         let loading_1 = inputs.loadings[trait_index + k];
@@ -357,8 +356,8 @@ fn compute_row_two_factors(
     for trait_index in 0..k {
         let fitted = inputs.loadings[trait_index] * factor_beta_0
             + inputs.loadings[trait_index + k] * factor_beta_1;
-        let beta = inputs.betas[row + inputs.n * trait_index];
-        let se = inputs.ses[row + inputs.n * trait_index];
+        let beta = inputs.betas[trait_index][row];
+        let se = inputs.ses[trait_index][row];
         scratch.residual[trait_index] = (beta - fitted) / se;
     }
     let Some(q) = symmetric_quadratic_form(inputs.q_inverse, &scratch.residual) else {
@@ -385,8 +384,8 @@ fn compute_row_generic(
     scratch.weighted_loadings.fill(0.0);
 
     for trait_index in 0..k {
-        let beta = inputs.betas[row + inputs.n * trait_index];
-        let se = inputs.ses[row + inputs.n * trait_index];
+        let beta = inputs.betas[trait_index][row];
+        let se = inputs.ses[trait_index][row];
         let corr_diag = inputs.corr[trait_index * k + trait_index];
         if !beta.is_finite() || !se.is_finite() || se <= 0.0 || corr_diag <= 0.0 {
             return STATUS_NON_FINITE;
@@ -450,7 +449,7 @@ fn compute_row_generic(
         }
     }
 
-    for factor_index in 0..f {
+    for (factor_index, se_value) in se_out.iter_mut().enumerate().take(f) {
         let mut variance = 0.0;
         for factor_a in 0..f {
             for factor_b in 0..f {
@@ -462,16 +461,16 @@ fn compute_row_generic(
         if !variance.is_finite() || variance < -1e-12 {
             return STATUS_NUMERICAL;
         }
-        se_out[factor_index] = variance.max(0.0).sqrt();
+        *se_value = variance.max(0.0).sqrt();
     }
 
     for trait_index in 0..k {
         let mut fitted = 0.0;
-        for factor_index in 0..f {
-            fitted += inputs.loadings[trait_index + k * factor_index] * beta_out[factor_index];
+        for (factor_index, factor_beta) in beta_out.iter().enumerate().take(f) {
+            fitted += inputs.loadings[trait_index + k * factor_index] * factor_beta;
         }
-        let beta = inputs.betas[row + inputs.n * trait_index];
-        let se = inputs.ses[row + inputs.n * trait_index];
+        let beta = inputs.betas[trait_index][row];
+        let se = inputs.ses[trait_index][row];
         scratch.residual[trait_index] = (beta - fitted) / se;
     }
 
@@ -524,17 +523,30 @@ fn compute_block(
     }
 }
 
-fn run_kernel(
-    betas: &[f64],
-    ses: &[f64],
+type KernelOutput = (Vec<f64>, Vec<f64>, Vec<f64>, Vec<i32>);
+
+#[allow(clippy::too_many_arguments)]
+fn run_kernel_columns(
+    betas: &[&[f64]],
+    ses: &[&[f64]],
     loadings: &[f64],
     corr_column_major: &[f64],
     q_corr_column_major: &[f64],
-    n: usize,
     traits: usize,
     factors: usize,
     requested_threads: usize,
-) -> Result<(Vec<f64>, Vec<f64>, Vec<f64>, Vec<i32>), i32> {
+) -> Result<KernelOutput, i32> {
+    if betas.len() != traits || ses.len() != traits || traits == 0 {
+        return Err(4);
+    }
+    let n = betas[0].len();
+    if n == 0
+        || betas.iter().any(|column| column.len() != n)
+        || ses.iter().any(|column| column.len() != n)
+    {
+        return Err(4);
+    }
+
     let mut corr = vec![0.0; traits * traits];
     let mut q_corr = vec![0.0; traits * traits];
     for row in 0..traits {
@@ -592,7 +604,6 @@ fn run_kernel(
         loadings,
         corr: &corr,
         q_inverse: &q_inverse,
-        n,
         traits,
         factors,
     };
@@ -649,11 +660,71 @@ fn run_kernel(
     Ok((beta_out, se_out, q_out, status_out))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn run_kernel(
+    betas: &[f64],
+    ses: &[f64],
+    loadings: &[f64],
+    corr_column_major: &[f64],
+    q_corr_column_major: &[f64],
+    n: usize,
+    traits: usize,
+    factors: usize,
+    requested_threads: usize,
+) -> Result<KernelOutput, i32> {
+    let beta_columns = betas.chunks_exact(n).collect::<Vec<_>>();
+    let se_columns = ses.chunks_exact(n).collect::<Vec<_>>();
+    run_kernel_columns(
+        &beta_columns,
+        &se_columns,
+        loadings,
+        corr_column_major,
+        q_corr_column_major,
+        traits,
+        factors,
+        requested_threads,
+    )
+}
+
+unsafe fn write_kernel_result(
+    result: std::thread::Result<Result<KernelOutput, i32>>,
+    n: usize,
+    factors: usize,
+    beta_out: *mut f64,
+    se_out: *mut f64,
+    q_out: *mut f64,
+    status_out: *mut i32,
+) -> i32 {
+    match result {
+        Ok(Ok((beta_values, se_values, q_values, status_values))) => {
+            for factor_index in 0..factors {
+                for row in 0..n {
+                    *beta_out.add(row + n * factor_index) =
+                        beta_values[row * factors + factor_index];
+                    *se_out.add(row + n * factor_index) = se_values[row * factors + factor_index];
+                }
+            }
+            std::ptr::copy_nonoverlapping(q_values.as_ptr(), q_out, n);
+            std::ptr::copy_nonoverlapping(status_values.as_ptr(), status_out, n);
+            0
+        }
+        Ok(Err(code)) => code,
+        Err(_) => -1,
+    }
+}
+
 /// Compute analytic GenomicSEM estimates for a batch of SNPs.
 ///
 /// All input matrices use R's column-major layout. Factor estimates and standard
 /// errors are written back in the same layout. The function returns zero on
 /// success, a positive global validation code, or -1 if a Rust panic was caught.
+///
+/// # Safety
+///
+/// Input pointers must be non-null, aligned, and readable for the lengths implied
+/// by `n`, `traits`, and `factors`. Output pointers must be non-null, aligned, and
+/// writable for `n * factors`, `n * factors`, `n`, and `n` elements respectively.
+/// Input and output memory must not overlap or be mutated during the call.
 #[no_mangle]
 pub unsafe extern "C" fn genomicsem_gls_batch(
     betas: *const f64,
@@ -690,22 +761,64 @@ pub unsafe extern "C" fn genomicsem_gls_batch(
         )
     }));
 
-    match result {
-        Ok(Ok((beta_values, se_values, q_values, status_values))) => {
-            for factor_index in 0..factors {
-                for row in 0..n {
-                    *beta_out.add(row + n * factor_index) =
-                        beta_values[row * factors + factor_index];
-                    *se_out.add(row + n * factor_index) = se_values[row * factors + factor_index];
-                }
-            }
-            std::ptr::copy_nonoverlapping(q_values.as_ptr(), q_out, n);
-            std::ptr::copy_nonoverlapping(status_values.as_ptr(), status_out, n);
-            0
-        }
-        Ok(Err(code)) => code,
-        Err(_) => -1,
-    }
+    write_kernel_result(result, n, factors, beta_out, se_out, q_out, status_out)
+}
+
+/// Compute a batch from separately allocated R numeric columns without copying
+/// them into temporary matrices. Each pointer must address `n` doubles and all
+/// columns must remain immutable for the duration of the call.
+///
+/// # Safety
+///
+/// `betas` and `ses` must each point to `traits` valid pointers, and every column
+/// pointer must be non-null, aligned, and readable for `n` doubles. The remaining
+/// input and output pointers have the same requirements as
+/// [`genomicsem_gls_batch`]. None of the referenced memory may be mutated during
+/// the call, and input and output memory must not overlap.
+#[no_mangle]
+pub unsafe extern "C" fn genomicsem_gls_batch_columns(
+    betas: *const *const f64,
+    ses: *const *const f64,
+    n: usize,
+    traits: usize,
+    loadings: *const f64,
+    factors: usize,
+    corr: *const f64,
+    q_corr: *const f64,
+    requested_threads: usize,
+    beta_out: *mut f64,
+    se_out: *mut f64,
+    q_out: *mut f64,
+    status_out: *mut i32,
+) -> i32 {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let beta_pointers = slice::from_raw_parts(betas, traits);
+        let se_pointers = slice::from_raw_parts(ses, traits);
+        let beta_columns = beta_pointers
+            .iter()
+            .map(|pointer| slice::from_raw_parts(*pointer, n))
+            .collect::<Vec<_>>();
+        let se_columns = se_pointers
+            .iter()
+            .map(|pointer| slice::from_raw_parts(*pointer, n))
+            .collect::<Vec<_>>();
+        let loadings = slice::from_raw_parts(loadings, traits * factors);
+        let corr = slice::from_raw_parts(corr, traits * traits);
+        let q_corr = slice::from_raw_parts(q_corr, traits * traits);
+
+        run_kernel_columns(
+            &beta_columns,
+            &se_columns,
+            loadings,
+            corr,
+            q_corr,
+            traits,
+            factors,
+            requested_threads,
+        )
+    }));
+
+    write_kernel_result(result, n, factors, beta_out, se_out, q_out, status_out)
 }
 
 #[cfg(test)]
