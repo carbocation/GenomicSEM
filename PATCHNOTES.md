@@ -19,6 +19,10 @@ Log of version histories.
   that previously occurred for every batch.
 - Analytic result columns are filled in one preallocated numeric matrix, and
   metadata is combined once after all batches complete.
+- Z statistics and normal/chi-square tail probabilities are finalized in the
+  native batch path. Rust distributes R's own Rmath probability routines across
+  the requested workers, preserving bit-for-bit results while avoiding large R
+  intermediate matrices.
 - Removed periodic forced garbage collections from the analytic batch loop;
   R's allocator now collects temporary batch outputs only when needed.
 - Added an internal R reference backend for numerical comparison. It can be

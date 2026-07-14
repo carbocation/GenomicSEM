@@ -109,6 +109,39 @@
   .check_analytic_gls_output(output)
 }
 
+.analytic_gls_results_columns_rust <- function(
+    betas, ses, loadings, corr, q_corr = corr,
+    start = 0L, count, threads = 1L, q_df) {
+  if (!is.list(betas) || !is.list(ses)) {
+    stop("'betas' and 'ses' must be lists of numeric columns.", call. = FALSE)
+  }
+  if (!all(vapply(betas, is.double, logical(1))) ||
+      !all(vapply(ses, is.double, logical(1)))) {
+    stop("All beta and SE columns must use double storage.", call. = FALSE)
+  }
+  loadings <- as.matrix(loadings)
+  corr <- as.matrix(corr)
+  q_corr <- as.matrix(q_corr)
+  storage.mode(loadings) <- "double"
+  storage.mode(corr) <- "double"
+  storage.mode(q_corr) <- "double"
+
+  output <- .Call(
+    .genomicsem_gls_results_columns,
+    betas,
+    ses,
+    loadings,
+    corr,
+    q_corr,
+    start,
+    count,
+    as.integer(threads),
+    q_df
+  )
+
+  .check_analytic_gls_output(output)$results
+}
+
 .analytic_gls_batch <- function(betas, ses, loadings, corr, q_corr = corr, threads = 1L,
                                 backend = getOption("GenomicSEM.analytic_backend", "rust")) {
   backend <- match.arg(backend, c("rust", "R"))

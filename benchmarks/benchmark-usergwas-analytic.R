@@ -73,7 +73,10 @@ run_public <- function() {
 }
 
 run_copying_input <- function() {
-  phase <- c(initialize = 0, extract = 0, kernel = 0, output = 0, assemble = 0)
+  phase <- c(
+    initialize = 0, extract = 0, kernel = 0,
+    statistics = 0, write = 0, assemble = 0
+  )
   start <- now()
 
   beta_columns <- match(paste0("beta.", traits), names(sumstats))
@@ -123,15 +126,19 @@ run_copying_input <- function() {
       2 * stats::pnorm(-abs(z_values)),
       nrow = length(rows), ncol = n_factors
     )
+    q_p_values <- stats::pchisq(
+      native$q, df = n_traits - n_factors, lower.tail = FALSE
+    )
+    phase[["statistics"]] <- phase[["statistics"]] + now() - phase_start
+
+    phase_start <- now()
     numeric_result[rows, factor_beta_columns] <- native$beta
     numeric_result[rows, factor_se_columns] <- native$se
     numeric_result[rows, factor_z_columns] <- z_values
     numeric_result[rows, factor_p_columns] <- p_values
     numeric_result[rows, q_column] <- native$q
-    numeric_result[rows, q_p_column] <- stats::pchisq(
-      native$q, df = n_traits - n_factors, lower.tail = FALSE
-    )
-    phase[["output"]] <- phase[["output"]] + now() - phase_start
+    numeric_result[rows, q_p_column] <- q_p_values
+    phase[["write"]] <- phase[["write"]] + now() - phase_start
   }
 
   phase_start <- now()
@@ -199,6 +206,7 @@ cat(sprintf("Copying-input median:   %.3f seconds\n", median_copying))
 cat(sprintf("  initialize:           %.3f seconds\n", median_phases[["initialize"]]))
 cat(sprintf("  extract matrices:     %.3f seconds\n", median_phases[["extract"]]))
 cat(sprintf("  Rust kernel:          %.3f seconds\n", median_phases[["kernel"]]))
-cat(sprintf("  statistics + output:  %.3f seconds\n", median_phases[["output"]]))
+cat(sprintf("  statistics:           %.3f seconds\n", median_phases[["statistics"]]))
+cat(sprintf("  matrix writes:        %.3f seconds\n", median_phases[["write"]]))
 cat(sprintf("  final assembly:       %.3f seconds\n", median_phases[["assemble"]]))
 cat(sprintf("Zero-copy speedup:      %.2fx\n", median_copying / median_public))

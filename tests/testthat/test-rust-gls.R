@@ -114,6 +114,59 @@ test_that("zero-copy Rust columns reject invalid row ranges", {
   )
 })
 
+test_that("native result finalization is identical to R statistics", {
+  for (n_factors in 1:3) {
+    inputs <- make_gls_inputs(
+      n_snps = 521L, n_traits = 9L, n_factors = n_factors,
+      seed = 800L + n_factors
+    )
+    inputs$betas[9L, 1L] <- 1e6
+    inputs$betas[10L, ] <- -1e4 * seq_len(ncol(inputs$betas))
+    rows <- 9:509
+    beta_columns <- as.data.frame(inputs$betas)
+    se_columns <- as.data.frame(inputs$ses)
+    kernel <- GenomicSEM:::.analytic_gls_columns_rust(
+      beta_columns, se_columns, inputs$loadings,
+      inputs$sampling_corr, inputs$q_corr,
+      start = min(rows) - 1L, count = length(rows), threads = 4L
+    )
+    q_df <- nrow(inputs$loadings) - n_factors
+    expected <- matrix(
+      NA_real_, nrow = length(rows), ncol = 4L * n_factors + 3L
+    )
+    for (factor_index in seq_len(n_factors)) {
+      first_column <- 4L * (factor_index - 1L) + 1L
+      z_values <- kernel$beta[, factor_index] / kernel$se[, factor_index]
+      expected[, first_column] <- kernel$beta[, factor_index]
+      expected[, first_column + 1L] <- kernel$se[, factor_index]
+      expected[, first_column + 2L] <- z_values
+      expected[, first_column + 3L] <- 2 * stats::pnorm(-abs(z_values))
+    }
+    q_column <- 4L * n_factors + 1L
+    expected[, q_column] <- kernel$q
+    expected[, q_column + 1L] <- q_df
+    expected[, q_column + 2L] <- stats::pchisq(
+      kernel$q, df = q_df, lower.tail = FALSE
+    )
+
+    parallel <- GenomicSEM:::.analytic_gls_results_columns_rust(
+      beta_columns, se_columns, inputs$loadings,
+      inputs$sampling_corr, inputs$q_corr,
+      start = min(rows) - 1L, count = length(rows), threads = 4L,
+      q_df = q_df
+    )
+    serial <- GenomicSEM:::.analytic_gls_results_columns_rust(
+      beta_columns, se_columns, inputs$loadings,
+      inputs$sampling_corr, inputs$q_corr,
+      start = min(rows) - 1L, count = length(rows), threads = 1L,
+      q_df = q_df
+    )
+
+    expect_identical(parallel, expected)
+    expect_identical(serial, expected)
+  }
+})
+
 test_that("two-factor specialization remains accurate for correlated loadings", {
   inputs <- make_gls_inputs(n_snps = 257L, n_traits = 10L, n_factors = 2L)
   inputs$loadings[, 2] <- inputs$loadings[, 1] +
@@ -171,6 +224,17 @@ test_that("invalid sampling inputs fail with an informative row", {
     GenomicSEM:::.analytic_gls_batch_rust(
       inputs$betas, inputs$ses, inputs$loadings,
       inputs$sampling_corr, inputs$q_corr
+    ),
+    "batch row 3.*non-positive SE"
+  )
+
+  beta_columns <- as.data.frame(inputs$betas)
+  se_columns <- as.data.frame(inputs$ses)
+  expect_error(
+    GenomicSEM:::.analytic_gls_results_columns_rust(
+      beta_columns, se_columns, inputs$loadings,
+      inputs$sampling_corr, inputs$q_corr,
+      count = nrow(inputs$betas), q_df = 6L
     ),
     "batch row 3.*non-positive SE"
   )

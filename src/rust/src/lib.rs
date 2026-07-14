@@ -524,6 +524,20 @@ fn compute_block(
 }
 
 type KernelOutput = (Vec<f64>, Vec<f64>, Vec<f64>, Vec<i32>);
+type NormalPValue = unsafe extern "C" fn(f64) -> f64;
+type ChiSquarePValue = unsafe extern "C" fn(f64, f64) -> f64;
+
+fn worker_count(n: usize, requested_threads: usize) -> usize {
+    let available_threads = thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1);
+    let workers_for_rows = n.div_ceil(MIN_ROWS_PER_WORKER).max(1);
+    requested_threads
+        .max(1)
+        .min(available_threads)
+        .min(workers_for_rows)
+        .min(n.max(1))
+}
 
 #[allow(clippy::too_many_arguments)]
 fn run_kernel_columns(
@@ -613,15 +627,7 @@ fn run_kernel_columns(
     let mut q_out = vec![f64::NAN; n];
     let mut status_out = vec![STATUS_OK; n];
 
-    let available_threads = thread::available_parallelism()
-        .map(|count| count.get())
-        .unwrap_or(1);
-    let workers_for_rows = n.div_ceil(MIN_ROWS_PER_WORKER).max(1);
-    let thread_count = requested_threads
-        .max(1)
-        .min(available_threads)
-        .min(workers_for_rows)
-        .min(n.max(1));
+    let thread_count = worker_count(n, requested_threads);
     let rows_per_thread = n.div_ceil(thread_count);
 
     if thread_count == 1 || n == 0 {
@@ -711,6 +717,85 @@ unsafe fn write_kernel_result(
         Ok(Err(code)) => code,
         Err(_) => -1,
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn write_finalized_kernel_result(
+    result: std::thread::Result<Result<KernelOutput, i32>>,
+    n: usize,
+    factors: usize,
+    requested_threads: usize,
+    q_df: f64,
+    normal_p_value: NormalPValue,
+    chi_square_p_value: ChiSquarePValue,
+    results_out: *mut f64,
+    status_out: *mut i32,
+) -> i32 {
+    let result = match result {
+        Ok(result) => result,
+        Err(_) => return -1,
+    };
+    let (beta_values, se_values, q_values, status_values) = match result {
+        Ok(values) => values,
+        Err(code) => return code,
+    };
+
+    std::ptr::copy_nonoverlapping(status_values.as_ptr(), status_out, n);
+    let result_columns = 4 * factors + 3;
+    let output = slice::from_raw_parts_mut(results_out, n * result_columns);
+    let mut remaining_columns = output.chunks_exact_mut(n).collect::<Vec<_>>();
+    let rows_per_thread = n.div_ceil(worker_count(n, requested_threads));
+    let beta_values = &beta_values;
+    let se_values = &se_values;
+    let q_values = &q_values;
+    let status_values = &status_values;
+
+    thread::scope(|scope| {
+        let mut start_row = 0;
+        while start_row < n {
+            let rows = rows_per_thread.min(n - start_row);
+            let mut worker_columns = Vec::with_capacity(result_columns);
+            let mut column_tails = Vec::with_capacity(result_columns);
+            for column in remaining_columns {
+                let (worker_column, tail) = column.split_at_mut(rows);
+                worker_columns.push(worker_column);
+                column_tails.push(tail);
+            }
+            remaining_columns = column_tails;
+
+            scope.spawn(move || {
+                for local_row in 0..rows {
+                    let row = start_row + local_row;
+                    if status_values[row] != STATUS_OK {
+                        for column in &mut worker_columns {
+                            column[local_row] = f64::NAN;
+                        }
+                        continue;
+                    }
+
+                    for factor_index in 0..factors {
+                        let beta = beta_values[row * factors + factor_index];
+                        let se = se_values[row * factors + factor_index];
+                        let z = beta / se;
+                        let first_column = 4 * factor_index;
+                        worker_columns[first_column][local_row] = beta;
+                        worker_columns[first_column + 1][local_row] = se;
+                        worker_columns[first_column + 2][local_row] = z;
+                        worker_columns[first_column + 3][local_row] = normal_p_value(z);
+                    }
+
+                    let q = q_values[row];
+                    let q_column = 4 * factors;
+                    worker_columns[q_column][local_row] = q;
+                    worker_columns[q_column + 1][local_row] = q_df;
+                    worker_columns[q_column + 2][local_row] = chi_square_p_value(q, q_df);
+                }
+            });
+            start_row += rows;
+        }
+    });
+
+    0
 }
 
 /// Compute analytic GenomicSEM estimates for a batch of SNPs.
@@ -819,6 +904,74 @@ pub unsafe extern "C" fn genomicsem_gls_batch_columns(
     }));
 
     write_kernel_result(result, n, factors, beta_out, se_out, q_out, status_out)
+}
+
+/// Compute and finalize a batch directly into the public analytic result layout.
+/// Distribution callbacks are supplied by the C bridge so the implementation
+/// continues to use R's own tail-probability routines.
+///
+/// # Safety
+///
+/// Input pointers have the same requirements as
+/// [`genomicsem_gls_batch_columns`]. `results_out` must be writable for
+/// `n * (4 * factors + 3)` doubles and `status_out` for `n` integers. The
+/// callbacks must be thread-safe for numeric inputs produced by the kernel and
+/// remain valid for the duration of the call.
+#[no_mangle]
+pub unsafe extern "C" fn genomicsem_gls_batch_columns_results(
+    betas: *const *const f64,
+    ses: *const *const f64,
+    n: usize,
+    traits: usize,
+    loadings: *const f64,
+    factors: usize,
+    corr: *const f64,
+    q_corr: *const f64,
+    requested_threads: usize,
+    q_df: f64,
+    normal_p_value: NormalPValue,
+    chi_square_p_value: ChiSquarePValue,
+    results_out: *mut f64,
+    status_out: *mut i32,
+) -> i32 {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let beta_pointers = slice::from_raw_parts(betas, traits);
+        let se_pointers = slice::from_raw_parts(ses, traits);
+        let beta_columns = beta_pointers
+            .iter()
+            .map(|pointer| slice::from_raw_parts(*pointer, n))
+            .collect::<Vec<_>>();
+        let se_columns = se_pointers
+            .iter()
+            .map(|pointer| slice::from_raw_parts(*pointer, n))
+            .collect::<Vec<_>>();
+        let loadings = slice::from_raw_parts(loadings, traits * factors);
+        let corr = slice::from_raw_parts(corr, traits * traits);
+        let q_corr = slice::from_raw_parts(q_corr, traits * traits);
+
+        run_kernel_columns(
+            &beta_columns,
+            &se_columns,
+            loadings,
+            corr,
+            q_corr,
+            traits,
+            factors,
+            requested_threads,
+        )
+    }));
+
+    write_finalized_kernel_result(
+        result,
+        n,
+        factors,
+        requested_threads,
+        q_df,
+        normal_p_value,
+        chi_square_p_value,
+        results_out,
+        status_out,
+    )
 }
 
 #[cfg(test)]

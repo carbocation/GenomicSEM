@@ -229,7 +229,7 @@
     batch_end     <- min(i + batch_size - 1, nrow(sumstats))
     batch_indices <- i:batch_end
     if (backend == "rust") {
-      kernel_results <- .analytic_gls_columns_rust(
+      batch_results <- .analytic_gls_results_columns_rust(
         betas = beta_data,
         ses = se_data,
         loadings = loadings,
@@ -237,8 +237,10 @@
         q_corr = q_corr,
         start = i - 1L,
         count = length(batch_indices),
-        threads = threads
+        threads = threads,
+        q_df = num_traits - num_factors
       )
+      numeric_results[batch_indices, ] <- batch_results
     } else {
       betas <- as.matrix(sumstats[batch_indices, beta_columns, drop = FALSE])
       ses <- as.matrix(sumstats[batch_indices, se_columns, drop = FALSE])
@@ -251,25 +253,25 @@
         threads = threads,
         backend = backend
       )
-    }
-    z_values <- kernel_results$beta / kernel_results$se
+      z_values <- kernel_results$beta / kernel_results$se
 
-    # ── Write batch results ──────────────────────────────────────────────────────
-    p_values <- matrix(
-      2 * stats::pnorm(-abs(z_values)),
-      nrow = length(batch_indices),
-      ncol = num_factors
-    )
-    numeric_results[batch_indices, factor_beta_columns] <- kernel_results$beta
-    numeric_results[batch_indices, factor_se_columns] <- kernel_results$se
-    numeric_results[batch_indices, factor_z_columns] <- z_values
-    numeric_results[batch_indices, factor_p_columns] <- p_values
-    numeric_results[batch_indices, q_column] <- kernel_results$q
-    numeric_results[batch_indices, q_p_column] <- stats::pchisq(
-      kernel_results$q,
-      df = num_traits - num_factors,
-      lower.tail = FALSE
-    )
+      # ── Write batch results ────────────────────────────────────────────────────
+      p_values <- matrix(
+        2 * stats::pnorm(-abs(z_values)),
+        nrow = length(batch_indices),
+        ncol = num_factors
+      )
+      numeric_results[batch_indices, factor_beta_columns] <- kernel_results$beta
+      numeric_results[batch_indices, factor_se_columns] <- kernel_results$se
+      numeric_results[batch_indices, factor_z_columns] <- z_values
+      numeric_results[batch_indices, factor_p_columns] <- p_values
+      numeric_results[batch_indices, q_column] <- kernel_results$q
+      numeric_results[batch_indices, q_p_column] <- stats::pchisq(
+        kernel_results$q,
+        df = num_traits - num_factors,
+        lower.tail = FALSE
+      )
+    }
 
     setTxtProgressBar(pb, batch_num)
   }
