@@ -1,5 +1,25 @@
 # GenomicSEM
 
+## Installing the Rust performance branch
+
+This branch adds a Rust-compiled analytic multivariate GWAS backend. Install a
+Rust toolchain first so that `cargo` and `rustc` are available on `PATH`, then
+install the `feature/rust` branch directly from GitHub:
+
+```r
+install.packages("remotes")
+remotes::install_github(
+  "carbocation/GenomicSEM",
+  ref = "feature/rust",
+  upgrade = "never"
+)
+
+library(GenomicSEM)
+```
+
+Rust is required while building the package but is not needed at runtime after
+installation. The general upstream installation instructions remain below.
+
 R-package which allows the user to fit structural equation models 
 based on the summary statistics obtained from genome wide association studies (GWAS). Note that a recent update includes the ability to automatically obtain Q_SNP results without running a separate follow-up model. Until explicitly stated otherwise the code on this github is an alpha version (now on version **0.0.5c**) and under active development. The code may thus produce undesired results on certain operating systems or when run concurrently with specific packages or R versions. Feel free to raise issues if (or when...) the package produces undesired results, we will attempt to swiftly deal with known issues. Please  **[visit the wiki](https://github.com/MichelNivard/GenomicSEM/wiki)** to get started, or **[check out the paper](https://www.nature.com/articles/s41562-019-0566-x)**. If you are having issues and not finding the answers anywhere on the wiki or FAQs page, we encourage you to post your question on the **[google group](https://groups.google.com/forum/#!forum/genomic-sem-users)**.
 
