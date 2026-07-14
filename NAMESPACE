@@ -1,4 +1,5 @@
 exportPattern("^[^\\.]")
+useDynLib(GenomicSEM, .registration = TRUE, .fixes = ".")
 import(plyr)
 import(e1071)
 import(readr)

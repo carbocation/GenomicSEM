@@ -1,0 +1,22 @@
+#!/bin/sh
+
+if command -v cargo >/dev/null 2>&1 && command -v rustc >/dev/null 2>&1; then
+    CARGO=$(command -v cargo)
+    RUSTC=$(command -v rustc)
+elif test -x "$HOME/.cargo/bin/cargo" && test -x "$HOME/.cargo/bin/rustc"; then
+    CARGO="$HOME/.cargo/bin/cargo"
+    RUSTC="$HOME/.cargo/bin/rustc"
+else
+    echo "ERROR: installing GenomicSEM requires cargo and rustc." >&2
+    echo "Install a stable Rust toolchain from https://rustup.rs/ and retry." >&2
+    exit 1
+fi
+
+"$CARGO" --version
+"$RUSTC" --version
+
+RUST_BIN_DIR=$(dirname "$CARGO")
+sed \
+    -e "s|@CARGO@|$CARGO|g" \
+    -e "s|@RUST_BIN_DIR@|$RUST_BIN_DIR|g" \
+    src/Makevars.in > src/Makevars

@@ -1,0 +1,19 @@
+OBJECTS = rust_gls.o init.o
+
+RUST_MANIFEST = rust/Cargo.toml
+RUST_SOURCES = rust/Cargo.toml rust/Cargo.lock rust/src/lib.rs
+RUST_TARGET_DIR = ../target/rust
+RUST_LIB = $(RUST_TARGET_DIR)/release/libgenomicsem_rust.a
+CARGO = @CARGO@
+RUST_BIN_DIR = @RUST_BIN_DIR@
+
+PKG_LIBS = $(RUST_LIB)
+
+$(SHLIB): $(RUST_LIB)
+
+$(RUST_LIB): $(RUST_SOURCES)
+	PATH="$(RUST_BIN_DIR):$$PATH" "$(CARGO)" build --manifest-path=$(RUST_MANIFEST) --target-dir=$(RUST_TARGET_DIR) --release --locked --jobs 2
+
+clean:
+	$(RM) $(OBJECTS) $(SHLIB)
+	PATH="$(RUST_BIN_DIR):$$PATH" "$(CARGO)" clean --manifest-path=$(RUST_MANIFEST) --target-dir=$(RUST_TARGET_DIR)

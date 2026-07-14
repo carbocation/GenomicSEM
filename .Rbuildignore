@@ -5,3 +5,6 @@
 ^.*\.log$
 ^.*\.Rhistory$
 ^build$
+(^|/)target($|/)
+^benchmarks$
+^src/Makevars$

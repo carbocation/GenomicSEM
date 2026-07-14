@@ -9,4 +9,8 @@ License: GPL-3.0
 Encoding: UTF-8
 LazyData: true
 Imports: plyr,e1071,readr,gdata,lavaan,doParallel,parallel,foreach,data.table,stringr,splitstackshape,Matrix,R.utils,dplyr,iterators,Rcpp,utils,mgsub,simsalapar
+Suggests: testthat (>= 3.0.0)
+Config/testthat/edition: 3
+SystemRequirements: Cargo (Rust compiler, edition 2021)
+NeedsCompilation: yes
 RoxygenNote: 7.3.3

@@ -42,7 +42,8 @@ userGWAS <- function(covstruc=NULL, SNPs=NULL, estimation="DWLS", model="", prin
         LDSCoutput = covstruc,
         model      = model,
         usermod    = usermod,
-        batch_size = batch_size
+        batch_size = batch_size,
+        cores      = cores
       )
     )
   }

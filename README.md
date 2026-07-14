@@ -36,6 +36,12 @@ Run multivariate TWAS using [`T-SEM`](https://github.com/GenomicSEM/GenomicSEM/w
 
 **Installation:**
 
+The analytic multivariate GWAS backend is compiled from Rust. Installing this
+development branch from source therefore requires a working Rust toolchain with
+`cargo` and `rustc` available on `PATH` or in the standard `~/.cargo/bin`
+location. The runtime does not require the Rust toolchain after the package has
+been built.
+
 We assume you are running R 3.4.1 or newer. We guarantee no backward or forward comparability. If something breaks please raise the issue on GitHub and we will try and fix it ASAP. 
 
 First, you need to install the `devtools` package. You can do this from CRAN, launch R and then type

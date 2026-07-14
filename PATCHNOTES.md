@@ -1,5 +1,21 @@
 Log of version histories.
 
+**Rust analytic backend. July 14th, 2026**
+- Replaced the per-SNP R matrix/list implementation used by
+  `userGWAS(analytic=TRUE)` with a batched Rust kernel.
+- The Rust kernel computes GLS factor effects, sandwich-corrected standard
+  errors, and omnibus Q statistics without constructing per-SNP R matrices.
+- The `cores` argument now controls Rust worker threads for analytic estimation.
+- Rust worker counts are capped by process-available parallelism and small
+  batches remain serial to avoid thread-startup overhead.
+- Source installation now discovers the Rust toolchain explicitly and uses the
+  committed Cargo lockfile for reproducible native builds.
+- Added an internal R reference backend for numerical comparison. It can be
+  selected for diagnostics with
+  `options(GenomicSEM.analytic_backend = "R")`.
+- Added Rust unit tests, R differential tests, and a reproducible benchmark in
+  `benchmarks/benchmark-rust-gls.R`.
+
 **0.0.1** Initial release  
 Able to perfrom all analysis in preprint
 

@@ -7,7 +7,7 @@ Function to obtain model estimates for a user-specified model across SNPs.
 \usage{
 userGWAS(covstruc=NULL,SNPs=NULL,estimation="DWLS",model="",printwarn=TRUE,sub=FALSE,cores=NULL,toler=FALSE,SNPSE=FALSE,
          parallel=TRUE,GC="standard",MPI=FALSE,smooth_check=FALSE,TWAS=FALSE,std.lv=FALSE,fix_measurement=TRUE,
-         Q_SNP=FALSE,analytic=FALSE,batch_size=100000,usermod=NULL, \dots)
+         Q_SNP=FALSE,analytic=FALSE,batch_size=100000,usermod=NULL)
 }
 \arguments{
    \item{covstruc}{Output from Genomic SEM `ldsc` function}
@@ -16,7 +16,7 @@ userGWAS(covstruc=NULL,SNPs=NULL,estimation="DWLS",model="",printwarn=TRUE,sub=F
    \item{model}{The user-specified model to use in model estimation using lavaan syntax. The SNP is referred to as 'SNP' in the model.}
    \item{printwarn}{Whether you want warnings and errors printed for each run. This can take up significant space across all SNPs, but the default is set to TRUE as these warnings may not be safe to ignore.} 
    \item{sub}{Whether you want to only output a piece of the model results (e.g., F1 ~ SNP). The argument takes a vector, as multiple pieces of the model result can be output.}
-   \item{cores}{Indicates how many cores to use when running in parallel. The default is NULL, in which case sumstats will use 1 less than the total number of cores available in the local environment.}
+   \item{cores}{Indicates how many cores to use when running in parallel. With \code{analytic = TRUE}, this controls the requested number of Rust worker threads, capped by the parallelism available to the process and the amount of work in each batch. The default is \code{NULL}, which uses one thread for analytic estimation.}
    \item{toler}{The tolerance to use for matrix inversion.} 
    \item{SNPSE}{Whether the user wants to provide a different standard error (SE) of the SNP variance than the package default. The default is to use .0005 to reflect the fact that the SNP SE is assumed to be population fixed.}
    \item{parallel}{Whether the function should run using parallel or serial processing. Default = TRUE}
@@ -27,7 +27,7 @@ userGWAS(covstruc=NULL,SNPs=NULL,estimation="DWLS",model="",printwarn=TRUE,sub=F
    \item{std.lv}{Optional argument to denote whether all latent variables are standardized using unit variance identification (default = FALSE)}
    \item{fix_measurement}{Optional argument to denote whether the measurement model should be fixed across all SNPs (default = TRUE)}
    \item{Q_SNP}{Logical. Whether to compute the Q_SNP heterogeneity statistic for each SNP. Default is \code{FALSE}.}
-   \item{analytic}{Logical. If \code{TRUE}, routes to a fast analytic GLS estimator instead of the default iterative lavaan-based approach. This is substantially faster for large GWAS datasets and returns factor-specific betas, sandwich-corrected SEs, Z-statistics, p-values, and an omnibus Q statistic per SNP. The \code{sub}, \code{cores}, \code{parallel}, and \code{MPI} arguments are ignored when \code{analytic = TRUE}. Default is \code{FALSE}.}
+   \item{analytic}{Logical. If \code{TRUE}, routes to a Rust-backed analytic GLS estimator instead of the default iterative lavaan-based approach. This is substantially faster for large GWAS datasets and returns factor-specific betas, sandwich-corrected SEs, Z-statistics, p-values, and an omnibus Q statistic per SNP. The \code{sub}, \code{parallel}, and \code{MPI} arguments are ignored when \code{analytic = TRUE}; \code{cores} controls Rust worker threads. Default is \code{FALSE}.}
    \item{batch_size}{Integer. Number of SNPs processed per batch when \code{analytic = TRUE}. Larger values increase memory use but reduce overhead. Default is \code{100000}.}
    \item{usermod}{Optional. A pre-fitted no-SNP model results data frame (the \code{$results} element from a \code{usermodel()} call). When supplied and \code{analytic = TRUE}, the function skips fitting the no-SNP model internally and uses these parameter estimates directly to extract factor loadings. Default is \code{NULL}.}
 }

@@ -20,6 +20,10 @@
 #'   Default is \code{NULL}.
 #' @param batch_size Integer. Number of SNPs to process per batch. Larger
 #'   values increase memory use but reduce overhead. Default is \code{100000}.
+#' @param cores Optional positive integer controlling the number of Rust worker
+#'   threads. The default, \code{NULL}, uses one thread.
+#' @param backend Internal diagnostic backend selector. Either \code{"rust"}
+#'   (the default) or \code{"R"} for the reference implementation.
 #'
 #' @return A \code{data.frame} with one row per SNP and the following columns:
 #'   \itemize{
@@ -71,10 +75,9 @@
 #' }
 #'
 #' @keywords internal
-.userGWASa <- function(sumstats, LDSCoutput, model, usermod = NULL, batch_size = 100000) {
-
-  # Helper function: V' M V
-  VMV <- function(V1, M, V2) { V1 %*% M %*% V2 }
+.userGWASa <- function(sumstats, LDSCoutput, model, usermod = NULL,
+                       batch_size = 100000, cores = NULL,
+                       backend = getOption("GenomicSEM.analytic_backend", "rust")) {
 
   start_time <- Sys.time()
   cat("userGWASa started at:", format(start_time, "%Y-%m-%d %H:%M:%S"), "\n")
@@ -82,11 +85,34 @@
   # Coerce to plain data.frame to ensure consistent column subsetting
   # regardless of whether input is a data.table, tibble, or other tabular class
   sumstats <- as.data.frame(sumstats)
+  if (nrow(sumstats) == 0L) {
+    stop("'sumstats' must contain at least one SNP.", call. = FALSE)
+  }
+  if (length(batch_size) != 1L || !is.numeric(batch_size) ||
+      !is.finite(batch_size) || batch_size < 1 || batch_size != floor(batch_size)) {
+    stop("'batch_size' must be a positive whole number.", call. = FALSE)
+  }
+  if (batch_size > .Machine$integer.max) {
+    stop("'batch_size' is too large for an R matrix.", call. = FALSE)
+  }
+  batch_size <- as.integer(batch_size)
+  if (is.null(cores)) {
+    threads <- 1L
+  } else {
+    if (length(cores) != 1L || !is.numeric(cores) || !is.finite(cores) ||
+        cores < 1 || cores != floor(cores)) {
+      stop("'cores' must be a positive whole number.", call. = FALSE)
+    }
+    if (cores > .Machine$integer.max) {
+      stop("'cores' is too large.", call. = FALSE)
+    }
+    threads <- as.integer(cores)
+  }
+  backend <- match.arg(backend, c("rust", "R"))
 
   # ── No-SNP model ──────────────────────────────────────────────────────────────
   if (is.character(model) & is.null(usermod)) {
     model_lines  <- strsplit(model, "\n")[[1]]
-    snp_lines    <- grep("~.*\\bSNP\\b", model_lines, value = TRUE)
     nosnp_model  <- paste(grep("~.*\\bSNP\\b", model_lines, value = TRUE, invert = TRUE),
                           collapse = "\n")
 
@@ -114,6 +140,9 @@
   traits     <- colnames(LDSCoutput$S)
   num_traits  <- ncol(LDSCoutput$S)
   num_factors <- length(factors)
+  if (num_factors == 0L) {
+    stop("No factor loadings were found in the no-SNP model.", call. = FALSE)
+  }
 
   combinations <- expand.grid(traits = traits, factors = factors)
   column_names <- paste0("lambda.", combinations$traits, "_", combinations$factors)
@@ -135,9 +164,28 @@
   }
 
   lambdas <- extract_lambdas(nosnpmod, factors, traits, num_traits, num_factors)
+  loadings <- matrix(as.numeric(lambdas), nrow = num_traits, ncol = num_factors)
+  colnames(loadings) <- factors
+
+  sampling_corr <- as.matrix(LDSCoutput$I)
+  q_corr <- sampling_corr
+  diag(sampling_corr)[diag(sampling_corr) < 1] <- 1
+
+  beta_names <- paste0("beta.", traits)
+  se_names <- paste0("se.", traits)
+  missing_columns <- setdiff(c(beta_names, se_names), colnames(sumstats))
+  if (length(missing_columns) > 0L) {
+    stop(
+      "'sumstats' is missing trait columns required by 'LDSCoutput': ",
+      paste(missing_columns, collapse = ", "),
+      call. = FALSE
+    )
+  }
+  beta_columns <- match(beta_names, colnames(sumstats))
+  se_columns <- match(se_names, colnames(sumstats))
 
   # ── Initialise output data frame ──────────────────────────────────────────────
-  GLS_mGWAS_results <- sumstats[, 1:6]
+  GLS_mGWAS_results <- sumstats[, 1:6, drop = FALSE]
 
   for (j in factors) {
     GLS_mGWAS_results[[paste0("beta_",   j)]] <- NA_real_
@@ -146,8 +194,9 @@
     GLS_mGWAS_results[[paste0("p_val_",  j)]] <- NA_real_
   }
 
-  GLS_mGWAS_results <- GLS_mGWAS_results %>%
-    mutate(Q_omnibus = NA_real_, Q_omnibus_df = NA_real_, Q_omnibus_pval = NA_real_)
+  GLS_mGWAS_results$Q_omnibus <- NA_real_
+  GLS_mGWAS_results$Q_omnibus_df <- NA_real_
+  GLS_mGWAS_results$Q_omnibus_pval <- NA_real_
 
   # ── Batch loop ────────────────────────────────────────────────────────────────
   total_batches <- ceiling(nrow(sumstats) / batch_size)
@@ -157,92 +206,42 @@
 
     i             <- (batch_num - 1) * batch_size + 1
     batch_end     <- min(i + batch_size - 1, nrow(sumstats))
-    snp_batch     <- sumstats[i:batch_end, ]
     batch_indices <- i:batch_end
-
-    betas <- snp_batch %>% select(contains("beta."))
-    SEs   <- snp_batch %>% select(contains("se."))
-
-    # Lambda matrix
-    lambdas_snp <- as.numeric(lambdas)
-    R_SNP       <- LDSCoutput$I
-    diag(R_SNP)[diag(R_SNP) < 1] <- 1
-    X      <- matrix(lambdas_snp, nrow = num_traits, ncol = num_factors)
-    colnames(X) <- factors
-
-    # SNP-trait beta and SE lists
-    beta_l   <- lapply(transpose(betas), function(x) as.numeric(unlist(x)))
-    se_snp   <- lapply(transpose(SEs),   function(x) as.numeric(unlist(x)))
-
-    # V_SNP list and its diagonalised inverse
-    V_SNP_list <- apply(SEs, 1, function(se) {
-    lavaan::lav_cor2cov(R = as.matrix(R_SNP), sds = as.numeric(se))
-    }, simplify = FALSE)
-
-    V_d_list_inv <- lapply(V_SNP_list, function(V_SNP) diag(1 / diag(V_SNP)))
-
-    # GLS factor betas (sandwich SE)
-    Beta_list <- unname(Map(function(V_d_inv, beta) {
-      solve(t(X) %*% V_d_inv %*% X) %*% t(X) %*% V_d_inv %*% beta
-    }, V_d_list_inv, beta_l))
-
-    SE_parallel_list <- unname(Map(function(V_d_inv, V_SNP) {
-      bread    <- solve(t(X) %*% V_d_inv %*% X)
-      meat     <- t(X) %*% V_d_inv %*% V_SNP %*% V_d_inv %*% X
-      sandwich <- bread %*% meat %*% bread
-      sqrt(diag(sandwich))
-    }, V_d_list_inv, V_SNP_list))
-
-    # Convert to data frames
-    SE_parallel_df <- as.data.frame(do.call(rbind, SE_parallel_list))
-    colnames(SE_parallel_df) <- paste0("SE_", factors)
-
-    Beta_parallel_df <- as.data.frame(do.call(rbind, lapply(Beta_list, as.numeric)))
-    colnames(Beta_parallel_df) <- paste0("Beta_", factors)
-
-    Z_df_parallel <- Beta_parallel_df / SE_parallel_df
-    colnames(Z_df_parallel) <- paste0("Z_", factors)
-
-    # ── Q_omnibus ───────────────────────────────────────────────────────────────
-    solveI <- solve(LDSCoutput$I)
-
-    beta_hats_list <- lapply(Beta_list, function(beta) {
-      as.matrix(beta)[, 1] %*% t(X)
-    })
-
-    Resid_parallel_list <- mapply(function(beta, beta_hat) {
-      unname(as.numeric(as.vector(beta) - beta_hat))
-    }, beta_l, beta_hats_list, SIMPLIFY = FALSE)
-
-    inside_list <- lapply(se_snp, function(SEs_snp) {
-      SEs_snp <- as.numeric(SEs_snp)
-      solveI / (SEs_snp %*% t(SEs_snp))
-    })
-
-    Q_Omnibus_parallel <- mapply(Resid_parallel_list, inside_list, Resid_parallel_list,
-                                 FUN = VMV)
+    betas <- as.matrix(sumstats[batch_indices, beta_columns, drop = FALSE])
+    ses <- as.matrix(sumstats[batch_indices, se_columns, drop = FALSE])
+    kernel_results <- .analytic_gls_batch(
+      betas = betas,
+      ses = ses,
+      loadings = loadings,
+      corr = sampling_corr,
+      q_corr = q_corr,
+      threads = threads,
+      backend = backend
+    )
+    z_values <- kernel_results$beta / kernel_results$se
 
     # ── Write batch results ──────────────────────────────────────────────────────
-    for (j in factors) {
-      GLS_mGWAS_results[batch_indices, paste0("beta_",   j)] <- Beta_parallel_df[, paste0("Beta_", j)]
-      GLS_mGWAS_results[batch_indices, paste0("SE_",     j)] <- SE_parallel_df[,   paste0("SE_",   j)]
-      GLS_mGWAS_results[batch_indices, paste0("Z_beta_", j)] <- Z_df_parallel[,    paste0("Z_",    j)]
-      GLS_mGWAS_results[batch_indices, paste0("p_val_",  j)] <- 2 * pnorm(-abs(
-        GLS_mGWAS_results[batch_indices, paste0("Z_beta_", j)]))
+    for (factor_index in seq_along(factors)) {
+      factor_name <- factors[[factor_index]]
+      GLS_mGWAS_results[batch_indices, paste0("beta_", factor_name)] <-
+        kernel_results$beta[, factor_index]
+      GLS_mGWAS_results[batch_indices, paste0("SE_", factor_name)] <-
+        kernel_results$se[, factor_index]
+      GLS_mGWAS_results[batch_indices, paste0("Z_beta_", factor_name)] <-
+        z_values[, factor_index]
+      GLS_mGWAS_results[batch_indices, paste0("p_val_", factor_name)] <-
+        2 * stats::pnorm(-abs(z_values[, factor_index]))
     }
 
-    GLS_mGWAS_results[batch_indices, "Q_omnibus"]    <- Q_Omnibus_parallel
-    GLS_mGWAS_results[batch_indices, "Q_omnibus_df"] <- length(colnames(betas)) - ncol(Beta_parallel_df)
-    GLS_mGWAS_results[batch_indices, "Q_omnibus_pval"] <- pchisq(
+    GLS_mGWAS_results[batch_indices, "Q_omnibus"] <- kernel_results$q
+    GLS_mGWAS_results[batch_indices, "Q_omnibus_df"] <- num_traits - num_factors
+    GLS_mGWAS_results[batch_indices, "Q_omnibus_pval"] <- stats::pchisq(
       GLS_mGWAS_results[batch_indices, "Q_omnibus"],
       df = GLS_mGWAS_results[batch_indices, "Q_omnibus_df"],
       lower.tail = FALSE
     )
 
-    GLS_mGWAS_results <- GLS_mGWAS_results %>% select(where(~ !all(is.na(.))))
-
     setTxtProgressBar(pb, batch_num)
-    rm(snp_batch)
     if (batch_num %% 10 == 0) gc()
   }
 
