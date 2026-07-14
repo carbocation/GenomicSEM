@@ -22,7 +22,7 @@ make_gls_inputs <- function(n_snps = 200L, n_traits = 8L, n_factors = 2L,
 }
 
 test_that("Rust analytic estimates agree with the R reference", {
-  for (n_factors in c(1L, 2L, 4L)) {
+  for (n_factors in c(1L, 2L, 3L, 4L)) {
     inputs <- make_gls_inputs(n_factors = n_factors, seed = 100L + n_factors)
     reference <- GenomicSEM:::.analytic_gls_batch_r(
       inputs$betas,
@@ -48,16 +48,56 @@ test_that("Rust analytic estimates agree with the R reference", {
 })
 
 test_that("Rust thread counts produce deterministic results", {
-  inputs <- make_gls_inputs(n_snps = 503L, n_factors = 3L)
-  serial <- GenomicSEM:::.analytic_gls_batch_rust(
+  for (n_factors in 1:3) {
+    inputs <- make_gls_inputs(n_snps = 503L, n_factors = n_factors)
+    serial <- GenomicSEM:::.analytic_gls_batch_rust(
+      inputs$betas, inputs$ses, inputs$loadings,
+      inputs$sampling_corr, inputs$q_corr, threads = 1L
+    )
+    parallel <- GenomicSEM:::.analytic_gls_batch_rust(
+      inputs$betas, inputs$ses, inputs$loadings,
+      inputs$sampling_corr, inputs$q_corr, threads = 4L
+    )
+    expect_identical(parallel, serial)
+  }
+})
+
+test_that("two-factor specialization remains accurate for correlated loadings", {
+  inputs <- make_gls_inputs(n_snps = 257L, n_traits = 10L, n_factors = 2L)
+  inputs$loadings[, 2] <- inputs$loadings[, 1] +
+    seq(-0.025, 0.025, length.out = nrow(inputs$loadings))
+  reference <- GenomicSEM:::.analytic_gls_batch_r(
     inputs$betas, inputs$ses, inputs$loadings,
-    inputs$sampling_corr, inputs$q_corr, threads = 1L
+    inputs$sampling_corr, inputs$q_corr
   )
-  parallel <- GenomicSEM:::.analytic_gls_batch_rust(
+  rust <- GenomicSEM:::.analytic_gls_batch_rust(
     inputs$betas, inputs$ses, inputs$loadings,
-    inputs$sampling_corr, inputs$q_corr, threads = 4L
+    inputs$sampling_corr, inputs$q_corr, threads = 2L
   )
-  expect_identical(parallel, serial)
+
+  expect_equal(rust$beta, reference$beta, tolerance = 1e-9)
+  expect_equal(rust$se, reference$se, tolerance = 1e-9)
+  expect_equal(rust$q, reference$q, tolerance = 1e-9)
+})
+
+test_that("precomputed Q inverse preserves LU pivoting semantics", {
+  inputs <- make_gls_inputs(n_snps = 31L, n_traits = 4L, n_factors = 1L)
+  inputs$q_corr <- diag(4L)
+  inputs$q_corr[1:2, 1:2] <- matrix(c(0, 0.4, 0.4, 0), 2L)
+  inputs$sampling_corr <- inputs$q_corr
+  diag(inputs$sampling_corr) <- 1
+  reference <- GenomicSEM:::.analytic_gls_batch_r(
+    inputs$betas, inputs$ses, inputs$loadings,
+    inputs$sampling_corr, inputs$q_corr
+  )
+  rust <- GenomicSEM:::.analytic_gls_batch_rust(
+    inputs$betas, inputs$ses, inputs$loadings,
+    inputs$sampling_corr, inputs$q_corr
+  )
+
+  expect_equal(rust$beta, reference$beta, tolerance = 1e-11)
+  expect_equal(rust$se, reference$se, tolerance = 1e-11)
+  expect_equal(rust$q, reference$q, tolerance = 1e-10)
 })
 
 test_that("singular factor models report the failing batch row", {

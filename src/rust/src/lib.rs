@@ -14,8 +14,7 @@ struct Inputs<'a> {
     ses: &'a [f64],
     loadings: &'a [f64],
     corr: &'a [f64],
-    q_lu: &'a [f64],
-    q_pivots: &'a [usize],
+    q_inverse: &'a [f64],
     n: usize,
     traits: usize,
     factors: usize,
@@ -30,7 +29,6 @@ struct Scratch {
     inverse: Vec<f64>,
     factor_work: Vec<f64>,
     residual: Vec<f64>,
-    trait_work: Vec<f64>,
 }
 
 impl Scratch {
@@ -44,7 +42,6 @@ impl Scratch {
             inverse: vec![0.0; factors * factors],
             factor_work: vec![0.0; factors],
             residual: vec![0.0; traits],
-            trait_work: vec![0.0; traits],
         }
     }
 }
@@ -156,7 +153,223 @@ fn invert_from_cholesky(chol: &[f64], inverse: &mut [f64], work: &mut [f64], siz
     }
 }
 
-fn compute_row(
+#[inline(always)]
+fn symmetric_quadratic_form(inverse: &[f64], residual: &[f64]) -> Option<f64> {
+    let size = residual.len();
+    let mut value = 0.0;
+    for row in 0..size {
+        let residual_row = residual[row];
+        value += inverse[row * size + row] * residual_row * residual_row;
+        for col in 0..row {
+            value += 2.0 * inverse[row * size + col] * residual_row * residual[col];
+        }
+    }
+    value.is_finite().then_some(value)
+}
+
+fn compute_row_one_factor(
+    row: usize,
+    inputs: Inputs<'_>,
+    beta_out: &mut [f64],
+    se_out: &mut [f64],
+    q_out: &mut f64,
+    scratch: &mut Scratch,
+) -> i32 {
+    let k = inputs.traits;
+    let mut normal = 0.0;
+    let mut rhs = 0.0;
+
+    for trait_index in 0..k {
+        let beta = inputs.betas[row + inputs.n * trait_index];
+        let se = inputs.ses[row + inputs.n * trait_index];
+        let corr_diag = inputs.corr[trait_index * k + trait_index];
+        let loading = inputs.loadings[trait_index];
+        if !beta.is_finite()
+            || !se.is_finite()
+            || se <= 0.0
+            || corr_diag <= 0.0
+            || !loading.is_finite()
+        {
+            return STATUS_NON_FINITE;
+        }
+
+        let weight = 1.0 / (corr_diag * se * se);
+        normal += loading * weight * loading;
+        rhs += loading * weight * beta;
+        scratch.weighted_loadings[trait_index] = loading / (corr_diag * se);
+    }
+    if !normal.is_finite() || normal <= 0.0 {
+        return STATUS_SINGULAR;
+    }
+
+    let factor_beta = rhs / normal;
+    if !factor_beta.is_finite() {
+        return STATUS_NUMERICAL;
+    }
+    beta_out[0] = factor_beta;
+
+    for trait_a in 0..k {
+        let mut value = 0.0;
+        for trait_b in 0..k {
+            value += inputs.corr[trait_a * k + trait_b] * scratch.weighted_loadings[trait_b];
+        }
+        scratch.corr_weighted_loadings[trait_a] = value;
+    }
+    let mut meat = 0.0;
+    for trait_index in 0..k {
+        meat +=
+            scratch.weighted_loadings[trait_index] * scratch.corr_weighted_loadings[trait_index];
+    }
+    let inverse = 1.0 / normal;
+    let variance = inverse * meat * inverse;
+    if !variance.is_finite() || variance < -1e-12 {
+        return STATUS_NUMERICAL;
+    }
+    se_out[0] = variance.max(0.0).sqrt();
+
+    for trait_index in 0..k {
+        let beta = inputs.betas[row + inputs.n * trait_index];
+        let se = inputs.ses[row + inputs.n * trait_index];
+        scratch.residual[trait_index] = (beta - inputs.loadings[trait_index] * factor_beta) / se;
+    }
+    let Some(q) = symmetric_quadratic_form(inputs.q_inverse, &scratch.residual) else {
+        return STATUS_NUMERICAL;
+    };
+    *q_out = q;
+
+    STATUS_OK
+}
+
+fn compute_row_two_factors(
+    row: usize,
+    inputs: Inputs<'_>,
+    beta_out: &mut [f64],
+    se_out: &mut [f64],
+    q_out: &mut f64,
+    scratch: &mut Scratch,
+) -> i32 {
+    let k = inputs.traits;
+    let mut normal_00 = 0.0;
+    let mut normal_01 = 0.0;
+    let mut normal_11 = 0.0;
+    let mut rhs_0 = 0.0;
+    let mut rhs_1 = 0.0;
+
+    for trait_index in 0..k {
+        let beta = inputs.betas[row + inputs.n * trait_index];
+        let se = inputs.ses[row + inputs.n * trait_index];
+        let corr_diag = inputs.corr[trait_index * k + trait_index];
+        let loading_0 = inputs.loadings[trait_index];
+        let loading_1 = inputs.loadings[trait_index + k];
+        if !beta.is_finite()
+            || !se.is_finite()
+            || se <= 0.0
+            || corr_diag <= 0.0
+            || !loading_0.is_finite()
+            || !loading_1.is_finite()
+        {
+            return STATUS_NON_FINITE;
+        }
+
+        let weight = 1.0 / (corr_diag * se * se);
+        normal_00 += loading_0 * weight * loading_0;
+        normal_01 += loading_0 * weight * loading_1;
+        normal_11 += loading_1 * weight * loading_1;
+        rhs_0 += loading_0 * weight * beta;
+        rhs_1 += loading_1 * weight * beta;
+        scratch.weighted_loadings[trait_index * 2] = loading_0 / (corr_diag * se);
+        scratch.weighted_loadings[trait_index * 2 + 1] = loading_1 / (corr_diag * se);
+    }
+
+    if !normal_00.is_finite() || normal_00 <= 0.0 {
+        return STATUS_SINGULAR;
+    }
+    let chol_00 = normal_00.sqrt();
+    let chol_10 = normal_01 / chol_00;
+    let chol_11_squared = normal_11 - chol_10 * chol_10;
+    if !chol_10.is_finite() || !chol_11_squared.is_finite() || chol_11_squared <= 0.0 {
+        return STATUS_SINGULAR;
+    }
+    let chol_11 = chol_11_squared.sqrt();
+
+    let forward_0 = rhs_0 / chol_00;
+    let forward_1 = (rhs_1 - chol_10 * forward_0) / chol_11;
+    let factor_beta_1 = forward_1 / chol_11;
+    let factor_beta_0 = (forward_0 - chol_10 * factor_beta_1) / chol_00;
+    if !factor_beta_0.is_finite() || !factor_beta_1.is_finite() {
+        return STATUS_NUMERICAL;
+    }
+    beta_out[0] = factor_beta_0;
+    beta_out[1] = factor_beta_1;
+
+    let inverse_chol_00 = 1.0 / chol_00;
+    let inverse_11 = 1.0 / chol_11_squared;
+    let inverse_01 = -chol_10 * inverse_chol_00 * inverse_11;
+    let scaled_chol_10 = chol_10 * inverse_chol_00;
+    let inverse_00 = 1.0 / normal_00 + scaled_chol_10 * scaled_chol_10 * inverse_11;
+    if !inverse_00.is_finite() || !inverse_01.is_finite() || !inverse_11.is_finite() {
+        return STATUS_NUMERICAL;
+    }
+
+    for trait_a in 0..k {
+        let mut value_0 = 0.0;
+        let mut value_1 = 0.0;
+        for trait_b in 0..k {
+            let corr_value = inputs.corr[trait_a * k + trait_b];
+            value_0 += corr_value * scratch.weighted_loadings[trait_b * 2];
+            value_1 += corr_value * scratch.weighted_loadings[trait_b * 2 + 1];
+        }
+        scratch.corr_weighted_loadings[trait_a * 2] = value_0;
+        scratch.corr_weighted_loadings[trait_a * 2 + 1] = value_1;
+    }
+
+    let mut meat_00 = 0.0;
+    let mut meat_01 = 0.0;
+    let mut meat_10 = 0.0;
+    let mut meat_11 = 0.0;
+    for trait_index in 0..k {
+        let weighted_0 = scratch.weighted_loadings[trait_index * 2];
+        let weighted_1 = scratch.weighted_loadings[trait_index * 2 + 1];
+        let corr_weighted_0 = scratch.corr_weighted_loadings[trait_index * 2];
+        let corr_weighted_1 = scratch.corr_weighted_loadings[trait_index * 2 + 1];
+        meat_00 += weighted_0 * corr_weighted_0;
+        meat_01 += weighted_0 * corr_weighted_1;
+        meat_10 += weighted_1 * corr_weighted_0;
+        meat_11 += weighted_1 * corr_weighted_1;
+    }
+
+    let variance_0 = inverse_00 * inverse_00 * meat_00
+        + inverse_00 * inverse_01 * (meat_01 + meat_10)
+        + inverse_01 * inverse_01 * meat_11;
+    let variance_1 = inverse_01 * inverse_01 * meat_00
+        + inverse_01 * inverse_11 * (meat_01 + meat_10)
+        + inverse_11 * inverse_11 * meat_11;
+    if !variance_0.is_finite()
+        || variance_0 < -1e-12
+        || !variance_1.is_finite()
+        || variance_1 < -1e-12
+    {
+        return STATUS_NUMERICAL;
+    }
+    se_out[0] = variance_0.max(0.0).sqrt();
+    se_out[1] = variance_1.max(0.0).sqrt();
+
+    for trait_index in 0..k {
+        let fitted = inputs.loadings[trait_index] * factor_beta_0
+            + inputs.loadings[trait_index + k] * factor_beta_1;
+        let beta = inputs.betas[row + inputs.n * trait_index];
+        let se = inputs.ses[row + inputs.n * trait_index];
+        scratch.residual[trait_index] = (beta - fitted) / se;
+    }
+    let Some(q) = symmetric_quadratic_form(inputs.q_inverse, &scratch.residual) else {
+        return STATUS_NUMERICAL;
+    };
+    *q_out = q;
+
+    STATUS_OK
+}
+
+fn compute_row_generic(
     row: usize,
     inputs: Inputs<'_>,
     beta_out: &mut [f64],
@@ -262,17 +475,9 @@ fn compute_row(
         scratch.residual[trait_index] = (beta - fitted) / se;
     }
 
-    scratch.trait_work.copy_from_slice(&scratch.residual);
-    lu_solve(inputs.q_lu, inputs.q_pivots, &mut scratch.trait_work, k);
-    let q = scratch
-        .residual
-        .iter()
-        .zip(scratch.trait_work.iter())
-        .map(|(left, right)| left * right)
-        .sum::<f64>();
-    if !q.is_finite() {
+    let Some(q) = symmetric_quadratic_form(inputs.q_inverse, &scratch.residual) else {
         return STATUS_NUMERICAL;
-    }
+    };
     *q_out = q;
 
     STATUS_OK
@@ -290,14 +495,32 @@ fn compute_block(
     for local_row in 0..q_out.len() {
         let beta_row = &mut beta_out[local_row * inputs.factors..(local_row + 1) * inputs.factors];
         let se_row = &mut se_out[local_row * inputs.factors..(local_row + 1) * inputs.factors];
-        status_out[local_row] = compute_row(
-            start_row + local_row,
-            inputs,
-            beta_row,
-            se_row,
-            &mut q_out[local_row],
-            &mut scratch,
-        );
+        status_out[local_row] = match inputs.factors {
+            1 => compute_row_one_factor(
+                start_row + local_row,
+                inputs,
+                beta_row,
+                se_row,
+                &mut q_out[local_row],
+                &mut scratch,
+            ),
+            2 => compute_row_two_factors(
+                start_row + local_row,
+                inputs,
+                beta_row,
+                se_row,
+                &mut q_out[local_row],
+                &mut scratch,
+            ),
+            _ => compute_row_generic(
+                start_row + local_row,
+                inputs,
+                beta_row,
+                se_row,
+                &mut q_out[local_row],
+                &mut scratch,
+            ),
+        };
     }
 }
 
@@ -345,14 +568,30 @@ fn run_kernel(
     if !lu_in_place(&mut q_lu, &mut q_pivots, traits) {
         return Err(3);
     }
+    let mut q_inverse = vec![0.0; traits * traits];
+    let mut q_work = vec![0.0; traits];
+    for col in 0..traits {
+        q_work.fill(0.0);
+        q_work[col] = 1.0;
+        lu_solve(&q_lu, &q_pivots, &mut q_work, traits);
+        for row in 0..traits {
+            q_inverse[row * traits + col] = q_work[row];
+        }
+    }
+    for row in 0..traits {
+        for col in 0..row {
+            let symmetric = 0.5 * (q_inverse[row * traits + col] + q_inverse[col * traits + row]);
+            q_inverse[row * traits + col] = symmetric;
+            q_inverse[col * traits + row] = symmetric;
+        }
+    }
 
     let inputs = Inputs {
         betas,
         ses,
         loadings,
         corr: &corr,
-        q_lu: &q_lu,
-        q_pivots: &q_pivots,
+        q_inverse: &q_inverse,
         n,
         traits,
         factors,

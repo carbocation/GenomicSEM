@@ -10,6 +10,10 @@ Log of version histories.
   batches remain serial to avoid thread-startup overhead.
 - Source installation now discovers the Rust toolchain explicitly and uses the
   committed Cargo lockfile for reproducible native builds.
+- Omnibus Q now precomputes its fixed inverse once per batch and evaluates each
+  SNP with a symmetric quadratic form instead of repeating an LU backsolve.
+- One- and two-factor models use specialized closed-form Rust kernels; models
+  with more factors continue to use the generic Cholesky implementation.
 - Added an internal R reference backend for numerical comparison. It can be
   selected for diagnostics with
   `options(GenomicSEM.analytic_backend = "R")`.
