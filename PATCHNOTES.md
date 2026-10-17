@@ -1,5 +1,36 @@
 Log of version histories.
 
+**Rust LD-score regression backend. October 16th, 2026**
+- `ldsc()` runs every heritability and genetic-covariance regression, with its
+  block jackknife, in a multithreaded Rust kernel (`src/rust/src/ldsc.rs`).
+  Results agree with the previous R implementation to rounding (relative
+  differences below 1e-9 on a 17-trait HapMap3 run; S below 1e-12) and the log
+  file is unchanged apart from timings.
+- The kernel follows the R code step by step: the same weights, the same
+  `floor(seq(1, n, length.out = n.blocks + 1))` block boundaries, block sums in
+  SNP order, compensated sums where R accumulates in long double, and 2x2
+  solves ordered as LAPACK `dgesv` does them. In the covariance branch,
+  `merged$weights` partially matches `weights_cov`, and the kernel uses that.
+- Each pair's SNPs are matched through integer LD-score indices instead of
+  `merge()` on SNP strings. With unique SNP IDs, `merge(y1, y2, sort = FALSE)`
+  keeps `y1`'s row order, which the kernel reproduces.
+- Summary statistics and LD-score files are read with `data.table::fread`, and
+  per-trait reading, joining and filtering run in forked workers
+  (`parallel::mclapply`; serial on Windows).
+- 17 traits, ~1.2M HapMap3 SNPs, 16 cores: 5 min 16 s -> 11-17 s.
+- Options: `GenomicSEM.ldsc_threads` (default `parallel::detectCores()`) sets
+  the worker count. `options(GenomicSEM.ldsc_backend = "R")` selects the
+  previous implementation, kept as the internal `.ldsc_legacy()`. That
+  implementation is also used automatically, with a message, for inputs the
+  fast path does not reproduce exactly: duplicated SNP IDs (where `merge()`
+  would create cartesian rows), LD-score files with columns other than CHR,
+  SNP, BP, CM, MAF and L2, fewer SNPs than jackknife blocks, or a singular
+  regression.
+- Added `tests/testthat/test-ldsc-rust.R`, comparing both backends on a
+  synthetic 22-chromosome reference with allele flips, missing SNPs, the
+  chi-square filter, a liability conversion, `select = "ODD"` and `chisq.max`,
+  and checking that serial and parallel runs are identical.
+
 **Rust analytic backend. July 14th, 2026**
 - Replaced the per-SNP R matrix/list implementation used by
   `userGWAS(analytic=TRUE)` with a batched Rust kernel.

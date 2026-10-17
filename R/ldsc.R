@@ -1,11 +1,93 @@
 ldsc <- function(traits, sample.prev, population.prev, ld, wld,
                 trait.names = NULL, sep_weights = FALSE, chr = 22,
                 n.blocks = 200, ldsc.log = NULL, stand = FALSE,select=FALSE,chisq.max = NA) {
-  
-  time <- proc.time()
-  
+
+  # The regressions run in the Rust kernel (src/rust/src/ldsc.rs) unless
+  # options(GenomicSEM.ldsc_backend = "R") selects the reference R
+  # implementation (.ldsc_legacy, R/ldsc_legacy.R). Inputs the fast path does
+  # not reproduce exactly (duplicated SNP IDs, extra LD-score columns, a block
+  # with no SNPs, a singular regression) also use the reference
+  # implementation. Worker threads: options(GenomicSEM.ldsc_threads).
+  backend <- match.arg(getOption("GenomicSEM.ldsc_backend", "rust"), c("rust", "R"))
+  args <- list(traits = traits, sample.prev = sample.prev, population.prev = population.prev,
+               ld = ld, wld = wld, trait.names = trait.names, sep_weights = sep_weights, chr = chr,
+               n.blocks = n.blocks, ldsc.log = ldsc.log, stand = stand, select = select,
+               chisq.max = chisq.max)
+  if (backend == "R") {
+    return(do.call(.ldsc_legacy, args))
+  }
+  out <- do.call(.ldsc_fast, args)
+  if (is.character(out)) {
+    message("ldsc: using the R implementation (", out, ")")
+    return(do.call(.ldsc_legacy, args))
+  }
+  out
+}
+
+.ldsc_workers <- function() {
+  threads <- as.integer(getOption("GenomicSEM.ldsc_threads", parallel::detectCores()))
+  if (.Platform$OS.type == "windows" || is.na(threads) || threads < 1L) 1L else threads
+}
+
+# Forked workers (one item each) on Unix; serial on Windows.
+.ldsc_lapply <- function(X, FUN) {
+  workers <- min(.ldsc_workers(), length(X))
+  if (workers <= 1L) return(lapply(X, FUN))
+  # Each forked worker reads one file; fread's own threads would oversubscribe.
+  out <- parallel::mclapply(X, function(item) {
+    options(GenomicSEM.ldsc_fread_threads = 1L)
+    FUN(item)
+  }, mc.cores = workers, mc.preschedule = FALSE)
+  failed <- vapply(out, inherits, logical(1), "try-error")
+  if (any(failed)) stop(out[[which(failed)[1]]], call. = FALSE)
+  out
+}
+
+.ldsc_read_ld <- function(dir, chroms, suffix) {
+  out <- do.call(rbind, .ldsc_lapply(chroms, function(i) {
+    data.table::fread(file.path(dir, paste0(i, suffix)), showProgress = FALSE, data.table = FALSE,
+                      nThread = getOption("GenomicSEM.ldsc_fread_threads", data.table::getDTthreads()))
+  }))
+  out$CM <- NULL
+  out$MAF <- NULL
+  out
+}
+
+# One trait: read, drop incomplete rows, join to the LD scores as
+# merge(y1, w) then merge(., x) do with sort = FALSE (y1's rows present in
+# both, in y1's order), order by CHR, BP (stable) and apply the chi-square
+# filter. Returns the kernel's columns and the counts the log reports.
+.ldsc_prepare_trait <- function(chi1, x, w, chisq.max) {
+  y1 <- data.table::fread(chi1, sep = "\t", na.strings = c("", "NA"), showProgress = FALSE,
+                          colClasses = list(character = c("SNP", "A1")), data.table = FALSE,
+                          nThread = getOption("GenomicSEM.ldsc_fread_threads", data.table::getDTthreads()))
+  y1 <- na.omit(y1)
+  if (anyDuplicated(y1$SNP)) return(list(duplicated = TRUE))
+  iw <- match(y1$SNP, w$SNP)
+  ix <- match(y1$SNP, x$SNP)
+  keep <- which(!is.na(iw) & !is.na(ix))
+  ord <- keep[order(x$CHR[ix[keep]], x$BP[ix[keep]])]
+  iw <- iw[ord]
+  ix <- ix[ord]
+  N <- as.double(y1$N[ord])
+  Z <- as.double(y1$Z[ord])
+  trait.chisq.max <- if (is.na(chisq.max)) max(0.001 * max(N), 80) else chisq.max
+  ok <- !(Z^2 > trait.chisq.max)
+  cols <- list(N = N[ok], Z = Z[ok], A1 = y1$A1[ord][ok], wLD = w$L2[iw][ok], L2 = x$L2[ix][ok],
+               id = ix[ok] - 1L)
+  cols$complete <- as.integer(complete.cases(as.data.frame(cols), x$CHR[ix][ok], x$BP[ix][ok]))
+  c(cols, list(duplicated = FALSE, n.read = nrow(y1), n.merged = length(ord), n.removed = sum(!ok),
+               chisq.max = trait.chisq.max, median.chi = median(cols$Z^2)))
+}
+
+# Returns the ldsc() result, or a string giving why the reference R
+# implementation must be used instead.
+.ldsc_fast <- function(traits, sample.prev, population.prev, ld, wld,
+                       trait.names = NULL, sep_weights = FALSE, chr = 22,
+                       n.blocks = 200, ldsc.log = NULL, stand = FALSE, select = FALSE, chisq.max = NA) {
+
   begin.time <- Sys.time()
-  
+
   if(is.null(ldsc.log)){
     logtraits<-gsub(".*/","",traits)
     log2<-paste(logtraits,collapse="_")
@@ -14,22 +96,22 @@ ldsc <- function(traits, sample.prev, population.prev, ld, wld,
     }
     log.file <- file(paste0(log2, "_ldsc.log"),open="wt")
   }else{log.file<-file(paste0(ldsc.log, "_ldsc.log"),open="wt")}
-  
+  fallback <- function(reason) { close(log.file); reason }
+
   if(!isFALSE(select) && !identical(select, "ODD") && !identical(select, "EVEN") && !is.numeric(select)){
+    close(log.file)
     stop("select must be one of the following values: FALSE, 'ODD', 'EVEN', or a numeric vector of chromosome numbers.")
   }
-  
+
   .LOG("Multivariate ld-score regression of ", length(traits), " traits ", "(", paste(traits, collapse = " "), ")", " began at: ", begin.time, file=log.file)
-  
-  if(identical(select, "ODD") || identical(select, "EVEN")){
-    odd<-seq(1,chr,2)
-    even<-seq(2,chr,2)
-  }
-  
+
+  chroms <- if (isFALSE(select)) 1:chr else if (identical(select, "ODD")) seq(1, chr, 2) else
+    if (identical(select, "EVEN")) seq(2, chr, 2) else select
+
   # Dimensions
   n.traits <- length(traits)
   n.V <- n.traits * (n.traits + 1) / 2
-  
+
   if(n.traits > 18){
     n.blocks<-(((n.traits+1)*(n.traits+2))/2)+1
     .LOG("     ", file=log.file, print = FALSE)
@@ -51,7 +133,6 @@ ldsc <- function(traits, sample.prev, population.prev, ld, wld,
   if(length(traits)==1)
     warning("Our version of ldsc requires 2 or more traits. Please include an additional trait.")
 
-
   # Storage:
   cov <- matrix(NA,nrow=n.traits,ncol=n.traits)
   V.hold <- matrix(NA,nrow=n.blocks,ncol=n.V)
@@ -59,411 +140,105 @@ ldsc <- function(traits, sample.prev, population.prev, ld, wld,
   Liab.S <- rep(1, n.traits)
   I <- matrix(NA,nrow=n.traits,ncol=n.traits)
 
-
   #########  READ LD SCORES:
   .LOG("Reading in LD scores", file=log.file)
-
-  if(isFALSE(select)){
-  x <- do.call("rbind", lapply(1:chr, function(i) {
-    suppressMessages(read_delim(
-      file.path(ld, paste0(i, ".l2.ldscore.gz")),
-      delim = "\t", escape_double = FALSE, trim_ws = TRUE, progress = FALSE))
-  }))
+  x <- .ldsc_read_ld(ld, chroms, ".l2.ldscore.gz")
+  w <- if (sep_weights) .ldsc_read_ld(wld, chroms, ".l2.ldscore.gz") else x
+  ld.cols <- c("CHR", "SNP", "BP", "L2")
+  if (!setequal(names(x), ld.cols) || !setequal(names(w), ld.cols) || names(w)[ncol(w)] != "L2") {
+    return(fallback("LD-score files with columns other than CHR, SNP, BP, CM, MAF, L2"))
   }
-
-  if(identical(select,"ODD")){
-    x <- do.call("rbind", lapply(odd, function(i) {
-      suppressMessages(read_delim(
-        file.path(ld, paste0(i, ".l2.ldscore.gz")),
-        delim = "\t", escape_double = FALSE, trim_ws = TRUE, progress = FALSE))
-    }))
+  if (anyDuplicated(x$SNP) || anyDuplicated(w$SNP)) {
+    return(fallback("duplicated SNP IDs in the LD-score files"))
   }
-
-  if(identical(select,"EVEN")){
-    x <- do.call("rbind", lapply(even, function(i) {
-      suppressMessages(read_delim(
-        file.path(ld, paste0(i, ".l2.ldscore.gz")),
-        delim = "\t", escape_double = FALSE, trim_ws = TRUE, progress = FALSE))
-    }))
-  }
-
-  if(is.numeric(select)){
-    x <- do.call("rbind", lapply(select, function(i) {
-      suppressMessages(read_delim(
-        file.path(ld, paste0(i, ".l2.ldscore.gz")),
-        delim = "\t", escape_double = FALSE, trim_ws = TRUE, progress = FALSE))
-    }))
-  }
-
-
-  x$CM <- NULL
-  x$MAF <- NULL
-
-
-  ######### READ weights:
-  if(sep_weights){
-    if(isFALSE(select)){
-    w <- do.call("rbind", lapply(1:chr, function(i) {
-      suppressMessages(read_delim(
-        file.path(wld, paste0(i, ".l2.ldscore.gz")),
-        delim = "\t", escape_double = FALSE, trim_ws = TRUE, progress = FALSE))
-    }))
-    }
-    if(identical(select, "EVEN")){
-      w <- do.call("rbind", lapply(even, function(i) {
-        suppressMessages(read_delim(
-          file.path(wld, paste0(i, ".l2.ldscore.gz")),
-          delim = "\t", escape_double = FALSE, trim_ws = TRUE, progress = FALSE))
-      }))
-    }
-    if(identical(select, "ODD")){
-      w <- do.call("rbind", lapply(odd, function(i) {
-        suppressMessages(read_delim(
-          file.path(wld, paste0(i, ".l2.ldscore.gz")),
-          delim = "\t", escape_double = FALSE, trim_ws = TRUE, progress = FALSE))
-      }))
-    }
-      if(is.numeric(select)){
-        w <- do.call("rbind", lapply(select, function(i) {
-          suppressMessages(read_delim(
-            file.path(wld, paste0(i, ".l2.ldscore.gz")),
-            delim = "\t", escape_double = FALSE, trim_ws = TRUE, progress = FALSE))
-        }))
-    }
-  }else{w<-x}
-
-  w$CM <- NULL
-  w$MAF <- NULL
-
-  colnames(w)[ncol(w)] <- "wLD"
 
   ### READ M
-
-  if(isFALSE(select)){
-  m <- do.call("rbind", lapply(1:chr, function(i) {
-    suppressMessages(read_csv(file.path(ld, paste0(i, ".l2.M_5_50")), col_names = FALSE))
-  }))
-  }
-
-  if(identical(select, "EVEN")){
-    m <- do.call("rbind", lapply(even, function(i) {
-      suppressMessages(read_csv(file.path(ld, paste0(i, ".l2.M_5_50")), col_names = FALSE))
-    }))
-  }
-
-  if(identical(select, "ODD")){
-    m <- do.call("rbind", lapply(odd, function(i) {
-      suppressMessages(read_csv(file.path(ld, paste0(i, ".l2.M_5_50")), col_names = FALSE))
-    }))
-  }
-
-  if(is.numeric(select)){
-    m <- do.call("rbind", lapply(select, function(i) {
-      suppressMessages(read_csv(file.path(ld, paste0(i, ".l2.M_5_50")), col_names = FALSE))
-    }))
-  }
-
-  M.tot <- sum(m)
-  m <- M.tot
+  m <- sum(unlist(lapply(chroms, function(i) scan(file.path(ld, paste0(i, ".l2.M_5_50")), quiet = TRUE))))
+  M.tot <- m
 
   ### READ ALL CHI2 + MERGE WITH LDSC FILES
-  s <- 0
-
-  all_y <- lapply(traits, function(chi1) {
-
-    ## READ chi2
-    y1 <- suppressMessages(na.omit(read_delim(
-      chi1, delim = "\t", escape_double = FALSE, trim_ws = TRUE, progress = FALSE)))
-
-    .LOG("Read in summary statistics [", s <<- s + 1, "/", n.traits, "] from: ", chi1, file=log.file)
-
-    ## Merge files
-    merged <- merge(y1[, c("SNP", "N", "Z", "A1")], w[, c("SNP", "wLD")], by = "SNP", sort = FALSE)
-    merged <- merge(merged, x, by = "SNP", sort = FALSE)
-    merged <- merged[with(merged, order(CHR, BP)), ]
-
-    .LOG("Out of ", nrow(y1), " SNPs, ", nrow(merged), " remain after merging with LD-score files", file=log.file)
-
-    ## REMOVE SNPS with excess chi-square:
-
-    if(is.na(chisq.max)){
-    chisq.max <- max(0.001 * max(merged$N), 80)
+  all_y <- .ldsc_lapply(traits, function(chi1) .ldsc_prepare_trait(chi1, x, w, chisq.max))
+  for (s in seq_len(n.traits)) {
+    chi1 <- traits[s]
+    y <- all_y[[s]]
+    .LOG("Read in summary statistics [", s, "/", n.traits, "] from: ", chi1, file=log.file)
+    if (y$duplicated) {
+      return(fallback(paste("duplicated SNP IDs in", chi1)))
     }
-    rm <- (merged$Z^2 > chisq.max)
-    merged <- merged[!rm, ]
-
-    .LOG("Removing ", sum(rm), " SNPs with Chi^2 > ", chisq.max, "; ", nrow(merged), " remain", file=log.file)
-
-    merged
-  })
-
-  # count the total nummer of runs, both loops
-  s <- 1
-
-  for(j in 1:n.traits){
-
-    chi1 <- traits[j]
-
-    y1 <- all_y[[j]]
-    y1$chi1 <- y1$Z^2
-
-    for(k in j:length(traits)){
-
-      ##### HERITABILITY code
-
-      if(j == k){
-
-        .LOG("     ", "     ", file=log.file, print = FALSE)
-        .LOG("Estimating heritability [", s, "/", n.V, "] for: ", chi1, file=log.file)
-
-        samp.prev <- sample.prev[j]
-        pop.prev <- population.prev[j]
-
-        merged <- y1
-        n.snps <- nrow(merged)
-
-        ## ADD INTERCEPT:
-        merged$intercept <- 1
-        merged$x.tot <- merged$L2
-        merged$x.tot.intercept <- 1
-
-
-        #### MAKE WEIGHTS:
-
-        tot.agg <- (M.tot*(mean(merged$chi1)-1))/mean(merged$L2*merged$N)
-        tot.agg <- max(tot.agg,0)
-        tot.agg <- min(tot.agg,1)
-        merged$ld <- pmax(merged$L2, 1)
-        merged$w.ld <- pmax(merged$wLD, 1)
-        merged$c <- tot.agg*merged$N/M.tot
-        merged$het.w <- 1/(2*(1+(merged$c*merged$ld))^2)
-        merged$oc.w <- 1/merged$w.ld
-        merged$w <- merged$het.w*merged$oc.w
-        merged$initial.w <- sqrt(merged$w)
-        merged$weights <- merged$initial.w/sum(merged$initial.w)
-
-        N.bar <- mean(merged$N)
-
-
-        ## preweight LD and chi:
-
-        weighted.LD <- as.matrix(cbind(merged$L2,merged$intercept)*merged$weights)
-        weighted.chi <- as.matrix(merged$chi1*merged$weights)
-
-
-        ## Perfrom analysis:
-
-        n.annot <- 1
-
-
-        select.from <- floor(seq(from=1,to=n.snps,length.out =(n.blocks+1)))
-        select.to <- c(select.from[2:n.blocks]-1,n.snps)
-
-        xty.block.values <- matrix(data=NA,nrow=n.blocks,ncol =(n.annot+1))
-        xtx.block.values <- matrix(data=NA,nrow =((n.annot+1)* n.blocks),ncol =(n.annot+1))
-        colnames(xty.block.values)<- colnames(xtx.block.values)<- colnames(weighted.LD)
-        replace.from <- seq(from=1,to=nrow(xtx.block.values),by =(n.annot+1))
-        replace.to <- seq(from =(n.annot+1),to=nrow(xtx.block.values),by =(n.annot+1))
-        for(i in 1:n.blocks){
-          xty.block.values[i,] <- t(t(weighted.LD[select.from[i]:select.to[i],])%*% weighted.chi[select.from[i]:select.to[i],])
-          xtx.block.values[replace.from[i]:replace.to[i],] <- as.matrix(t(weighted.LD[select.from[i]:select.to[i],])%*% weighted.LD[select.from[i]:select.to[i],])
-        }
-        xty <- as.matrix(colSums(xty.block.values))
-        xtx <- matrix(data=NA,nrow =(n.annot+1),ncol =(n.annot+1))
-        colnames(xtx)<- colnames(weighted.LD)
-        for(i in 1:nrow(xtx)){xtx[i,] <- t(colSums(xtx.block.values[seq(from=i,to=nrow(xtx.block.values),by=ncol(weighted.LD)),]))}
-
-        reg <- solve(xtx, xty)
-        intercept <- reg[2]
-        coefs <- reg[1]/N.bar
-        reg.tot <- coefs*m
-
-        delete.from <- seq(from=1,to=nrow(xtx.block.values),by=ncol(xtx.block.values))
-        delete.to <- seq(from=ncol(xtx.block.values),to=nrow(xtx.block.values),by=ncol(xtx.block.values))
-        delete.values <- matrix(data=NA,nrow=n.blocks,ncol =(n.annot+1))
-        colnames(delete.values)<- colnames(weighted.LD)
-        for(i in 1:n.blocks){
-          xty.delete <- xty-xty.block.values[i,]
-          xtx.delete <- xtx-xtx.block.values[delete.from[i]:delete.to[i],]
-          delete.values[i,] <- solve(xtx.delete, xty.delete)
-        }
-
-        tot.delete.values <- delete.values[,1:n.annot]
-        pseudo.values <- matrix(data=NA,nrow=n.blocks,ncol=length(reg))
-        colnames(pseudo.values)<- colnames(weighted.LD)
-        for(i in 1:n.blocks){pseudo.values[i,] <- (n.blocks*reg)-((n.blocks-1)* delete.values[i,])}
-
-        jackknife.cov <- cov(pseudo.values)/n.blocks
-        jackknife.se <- sqrt(diag(jackknife.cov))
-        intercept.se <- jackknife.se[length(jackknife.se)]
-        coef.cov <- jackknife.cov[1:n.annot,1:n.annot]/(N.bar^2)
-
-        cat.cov <- coef.cov*(m %*% t(m))
-        tot.cov <- sum(cat.cov)
-        tot.se <- sqrt(tot.cov)
-
-        V.hold[,s] <- pseudo.values[,1]
-        N.vec[1,s] <- N.bar
-
-        if(is.na(pop.prev)==F & is.na(samp.prev)==F){
-          conversion.factor <- (pop.prev^2*(1-pop.prev)^2)/(samp.prev*(1-samp.prev)* dnorm(qnorm(1-pop.prev))^2)
-          Liab.S[j] <- conversion.factor
-          .LOG("     ", file=log.file, print = FALSE)
-          .LOG("Please note that the results initially printed to the screen and log file reflect the NON-liability h2 and cov_g. However, a liability conversion is being used for trait ",
-              chi1, " when creating the genetic covariance matrix used as input for Genomic SEM and liability scale results are printed at the end of the log file.", file=log.file)
-          .LOG("     ", file=log.file, print = FALSE)
-        }
-
-        cov[j,j] <- reg.tot
-        I[j,j] <- intercept
-
-        lambda.gc <- median(merged$chi1) / qchisq(0.5, df = 1)
-        mean.Chi <- mean(merged$chi1)
-        ratio <- (intercept - 1) / (mean.Chi - 1)
-        ratio.se <- intercept.se / (mean.Chi - 1)
-
-        .LOG("Heritability Results for trait: ", chi1, file=log.file)
-        .LOG("Mean Chi^2 across remaining SNPs: ", round(mean.Chi, 4), file=log.file)
-        .LOG("Lambda GC: ", round(lambda.gc, 4), file=log.file)
-        .LOG("Intercept: ", round(intercept, 4), " (", round(intercept.se, 4), ")", file=log.file)
-        .LOG("Ratio: ", round(ratio, 4), " (", round(ratio.se, 4), ")", file=log.file)
-        .LOG("Total Observed Scale h2: ", round(reg.tot, 4), " (", round(tot.se, 4), ")", file=log.file)
-        .LOG("h2 Z: ", format(reg.tot / tot.se, digits = 3), file=log.file)
-      }
-
-
-      ##### GENETIC COVARIANCE code
-
-      if(j != k){
-
-        .LOG("     ", file=log.file, print = FALSE)
-
-        chi2 <- traits[k]
-        .LOG("Calculating genetic covariance [", s, "/", n.V, "] for traits: ", chi1, " and ", chi2, file=log.file)
-
-        # Reuse the data read in for heritability
-        y2 <- all_y[[k]]
-        y <- merge(y1, y2[, c("SNP", "N", "Z", "A1")], by = "SNP", sort = FALSE)
-
-        y$Z.x <- ifelse(y$A1.y == y$A1.x, y$Z.x, -y$Z.x)
-        y$ZZ <- y$Z.y * y$Z.x
-        y$chi2 <- y$Z.y^2
-        merged <- na.omit(y)
-        n.snps <- nrow(merged)
-
-        .LOG(n.snps, " SNPs remain after merging ", chi1, " and ", chi2, " summary statistics", file=log.file)
-
-        ## ADD INTERCEPT:
-        merged$intercept <- 1
-        merged$x.tot <- merged$L2
-        merged$x.tot.intercept <- 1
-
-
-        #### MAKE WEIGHTS:
-
-        tot.agg <- (M.tot*(mean(merged$chi1)-1))/mean(merged$L2*merged$N.x)
-        tot.agg <- max(tot.agg,0)
-        tot.agg <- min(tot.agg,1)
-        merged$ld <- pmax(merged$L2, 1)
-        merged$w.ld <- pmax(merged$wLD, 1)
-        merged$c <- tot.agg*merged$N.x/M.tot
-        merged$het.w <- 1/(2*(1+(merged$c*merged$ld))^2)
-        merged$oc.w <- 1/merged$w.ld
-        merged$w <- merged$het.w*merged$oc.w
-        merged$initial.w <- sqrt(merged$w)
-
-        tot.agg2 <- (M.tot*(mean(merged$chi2)-1))/mean(merged$L2*merged$N.y)
-        tot.agg2 <- max(tot.agg2,0)
-        tot.agg2 <- min(tot.agg2,1)
-        merged$ld2 <- pmax(merged$L2, 1)
-        merged$w.ld2 <- pmax(merged$wLD, 1)
-        merged$c2 <- tot.agg2*merged$N.y/M.tot
-        merged$het.w2 <- 1/(2*(1+(merged$c2*merged$ld))^2)
-        merged$oc.w2 <- 1/merged$w.ld2
-        merged$w2 <- merged$het.w2*merged$oc.w2
-        merged$initial.w2 <- sqrt(merged$w2)
-
-
-        merged$weights_cov <- (merged$initial.w + merged$initial.w2)/sum(merged$initial.w + merged$initial.w2 )
-
-        N.bar <- sqrt(mean(merged$N.x)*mean(merged$N.y))
-
-        ## preweight LD and chi:
-
-        weighted.LD <- as.matrix(cbind(merged$L2,merged$intercept)*merged$weights)
-        weighted.chi <- as.matrix(merged$ZZ *merged$weights_cov)
-
-        ## Perfrom analysis:
-
-
-        n.annot <- 1
-
-
-        select.from <- floor(seq(from=1,to=n.snps,length.out =(n.blocks+1)))
-        select.to <- c(select.from[2:n.blocks]-1,n.snps)
-
-        xty.block.values <- matrix(data=NA,nrow=n.blocks,ncol =(n.annot+1))
-        xtx.block.values <- matrix(data=NA,nrow =((n.annot+1)* n.blocks),ncol =(n.annot+1))
-        colnames(xty.block.values)<- colnames(xtx.block.values)<- colnames(weighted.LD)
-        replace.from <- seq(from=1,to=nrow(xtx.block.values),by =(n.annot+1))
-        replace.to <- seq(from =(n.annot+1),to=nrow(xtx.block.values),by =(n.annot+1))
-        for(i in 1:n.blocks){
-          xty.block.values[i,] <- t(t(weighted.LD[select.from[i]:select.to[i],])%*% weighted.chi[select.from[i]:select.to[i],])
-          xtx.block.values[replace.from[i]:replace.to[i],] <- as.matrix(t(weighted.LD[select.from[i]:select.to[i],])%*% weighted.LD[select.from[i]:select.to[i],])
-        }
-        xty <- as.matrix(colSums(xty.block.values))
-        xtx <- matrix(data=NA,nrow =(n.annot+1),ncol =(n.annot+1))
-        colnames(xtx)<- colnames(weighted.LD)
-        for(i in 1:nrow(xtx)){xtx[i,] <- t(colSums(xtx.block.values[seq(from=i,to=nrow(xtx.block.values),by=ncol(weighted.LD)),]))}
-
-        reg <- solve(xtx, xty)
-        intercept <- reg[2]
-        coefs <- reg[1]/N.bar
-        reg.tot <- coefs*m
-
-        delete.from <- seq(from=1,to=nrow(xtx.block.values),by=ncol(xtx.block.values))
-        delete.to <- seq(from=ncol(xtx.block.values),to=nrow(xtx.block.values),by=ncol(xtx.block.values))
-        delete.values <- matrix(data=NA,nrow=n.blocks,ncol =(n.annot+1))
-        colnames(delete.values)<- colnames(weighted.LD)
-        for(i in 1:n.blocks){
-          xty.delete <- xty-xty.block.values[i,]
-          xtx.delete <- xtx-xtx.block.values[delete.from[i]:delete.to[i],]
-          delete.values[i,] <- solve(xtx.delete, xty.delete)
-        }
-
-        tot.delete.values <- delete.values[,1:n.annot]
-        pseudo.values <- matrix(data=NA,nrow=n.blocks,ncol=length(reg))
-        colnames(pseudo.values)<- colnames(weighted.LD)
-        for(i in 1:n.blocks){pseudo.values[i,] <- (n.blocks*reg)-((n.blocks-1)* delete.values[i,])}
-
-        jackknife.cov <- cov(pseudo.values)/n.blocks
-        jackknife.se <- sqrt(diag(jackknife.cov))
-        intercept.se <- jackknife.se[length(jackknife.se)]
-        coef.cov <- jackknife.cov[1:n.annot,1:n.annot]/(N.bar^2)
-        cat.cov <- coef.cov*(m %*% t(m))
-        tot.cov <- sum(cat.cov)
-        tot.se <- sqrt(tot.cov)
-
-        V.hold[, s] <- pseudo.values[, 1]
-        N.vec[1, s] <- N.bar
-
-        cov[k, j] <- cov[j, k] <- reg.tot
-        I[k, j] <- I[j, k] <- intercept
-
-        .LOG("Results for genetic covariance between: ", chi1, " and ", chi2, file=log.file)
-        .LOG("Mean Z*Z: ", round(mean(merged$ZZ), 4), file=log.file)
-        .LOG("Cross trait Intercept: ", round(intercept, 4), " (", round(intercept.se, 4), ")", file=log.file)
-        .LOG("Total Observed Scale Genetic Covariance (g_cov): ", round(reg.tot, 4), " (", round(tot.se, 4), ")", file=log.file)
-        .LOG("g_cov Z: ", format(reg.tot / tot.se, digits = 3), file=log.file)
-        .LOG("g_cov P-value: ", format(2 * pnorm(abs(reg.tot / tot.se), lower.tail = FALSE), digits = 5), file=log.file)
-      }
-
-      ### Total count
-      s <- s + 1
-    }
+    .LOG("Out of ", y$n.read, " SNPs, ", y$n.merged, " remain after merging with LD-score files", file=log.file)
+    .LOG("Removing ", y$n.removed, " SNPs with Chi^2 > ", y$chisq.max, "; ", length(y$Z), " remain", file=log.file)
   }
 
+  # Pairs in the order of the reference implementation's loops.
+  pairs <- do.call(rbind, lapply(seq_len(n.traits), function(j) cbind(j, j:n.traits)))
+  alleles <- unique(unlist(lapply(all_y, `[[`, "A1")))
+  rows <- vapply(all_y, function(y) length(y$Z), integer(1))
+  col <- function(name) unlist(lapply(all_y, `[[`, name), use.names = FALSE)
+  res <- .Call(.genomicsem_ldsc,
+               as.double(col("L2")), as.double(col("wLD")), col("N"), col("Z"),
+               match(col("A1"), alleles), as.integer(col("id")),
+               col("complete"),
+               as.integer(c(0L, cumsum(rows))), as.integer(nrow(x)),
+               as.integer(pairs[, 1] - 1L), as.integer(pairs[, 2] - 1L),
+               as.double(M.tot), as.integer(n.blocks),
+               .ldsc_workers())
+  if (any(res$status != 0L)) {
+    return(fallback(if (any(res$status == 2L)) "fewer SNPs than jackknife blocks" else "a singular regression"))
+  }
 
+  for (s in seq_len(n.V)) {
+    j <- pairs[s, 1]; k <- pairs[s, 2]
+    chi1 <- traits[j]
+    reg.tot <- res$reg_tot[s]
+    intercept <- res$intercept[s]
+    intercept.se <- res$intercept_se[s]
+    tot.se <- res$tot_se[s]
+    V.hold[, s] <- res$pseudo[, s]
+    N.vec[1, s] <- res$n_bar[s]
+
+    if (j == k) {
+      .LOG("     ", "     ", file=log.file, print = FALSE)
+      .LOG("Estimating heritability [", s, "/", n.V, "] for: ", chi1, file=log.file)
+      samp.prev <- sample.prev[j]
+      pop.prev <- population.prev[j]
+      if(is.na(pop.prev)==F & is.na(samp.prev)==F){
+        conversion.factor <- (pop.prev^2*(1-pop.prev)^2)/(samp.prev*(1-samp.prev)* dnorm(qnorm(1-pop.prev))^2)
+        Liab.S[j] <- conversion.factor
+        .LOG("     ", file=log.file, print = FALSE)
+        .LOG("Please note that the results initially printed to the screen and log file reflect the NON-liability h2 and cov_g. However, a liability conversion is being used for trait ",
+            chi1, " when creating the genetic covariance matrix used as input for Genomic SEM and liability scale results are printed at the end of the log file.", file=log.file)
+        .LOG("     ", file=log.file, print = FALSE)
+      }
+      cov[j,j] <- reg.tot
+      I[j,j] <- intercept
+
+      lambda.gc <- all_y[[j]]$median.chi / qchisq(0.5, df = 1)
+      mean.Chi <- res$mean_y[s]
+      ratio <- (intercept - 1) / (mean.Chi - 1)
+      ratio.se <- intercept.se / (mean.Chi - 1)
+
+      .LOG("Heritability Results for trait: ", chi1, file=log.file)
+      .LOG("Mean Chi^2 across remaining SNPs: ", round(mean.Chi, 4), file=log.file)
+      .LOG("Lambda GC: ", round(lambda.gc, 4), file=log.file)
+      .LOG("Intercept: ", round(intercept, 4), " (", round(intercept.se, 4), ")", file=log.file)
+      .LOG("Ratio: ", round(ratio, 4), " (", round(ratio.se, 4), ")", file=log.file)
+      .LOG("Total Observed Scale h2: ", round(reg.tot, 4), " (", round(tot.se, 4), ")", file=log.file)
+      .LOG("h2 Z: ", format(reg.tot / tot.se, digits = 3), file=log.file)
+    } else {
+      .LOG("     ", file=log.file, print = FALSE)
+      chi2 <- traits[k]
+      .LOG("Calculating genetic covariance [", s, "/", n.V, "] for traits: ", chi1, " and ", chi2, file=log.file)
+      .LOG(res$n_snps[s], " SNPs remain after merging ", chi1, " and ", chi2, " summary statistics", file=log.file)
+      cov[k, j] <- cov[j, k] <- reg.tot
+      I[k, j] <- I[j, k] <- intercept
+      .LOG("Results for genetic covariance between: ", chi1, " and ", chi2, file=log.file)
+      .LOG("Mean Z*Z: ", round(res$mean_y[s], 4), file=log.file)
+      .LOG("Cross trait Intercept: ", round(intercept, 4), " (", round(intercept.se, 4), ")", file=log.file)
+      .LOG("Total Observed Scale Genetic Covariance (g_cov): ", round(reg.tot, 4), " (", round(tot.se, 4), ")", file=log.file)
+      .LOG("g_cov Z: ", format(reg.tot / tot.se, digits = 3), file=log.file)
+      .LOG("g_cov P-value: ", format(2 * pnorm(abs(reg.tot / tot.se), lower.tail = FALSE), digits = 5), file=log.file)
+    }
+  }
   ## Scale V to N per study (assume m constant)
   # /!\ crossprod instead of tcrossprod because N.vec is a one-row matrix
   v.out <- cov(V.hold) / crossprod(N.vec * (sqrt(n.blocks) / m))
@@ -581,3 +356,4 @@ ldsc <- function(traits, sample.prev, population.prev, ld, wld,
     list(V=V,S=S,I=I,N=N.vec,m=m)
   }
 }
+

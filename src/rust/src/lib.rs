@@ -2,6 +2,8 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::slice;
 use std::thread;
 
+mod ldsc;
+
 const STATUS_OK: i32 = 0;
 const STATUS_NON_FINITE: i32 = 1;
 const STATUS_SINGULAR: i32 = 2;
@@ -972,6 +974,95 @@ pub unsafe extern "C" fn genomicsem_gls_batch_columns_results(
         results_out,
         status_out,
     )
+}
+
+/// Run every LD-score regression of `ldsc()` (see `ldsc.rs`). Trait columns are
+/// concatenated across traits with `offsets[t]..offsets[t + 1]` delimiting
+/// trait t. Outputs have one entry per pair, except `pseudo_out`, which is
+/// column-major `n_blocks` x `n_pairs`. Returns 0, or -1 if a panic was caught.
+///
+/// # Safety
+///
+/// Every input pointer must be readable for the lengths implied by `offsets`,
+/// `n_traits` and `n_pairs`; every output pointer writable for `n_pairs`
+/// (`n_blocks * n_pairs` for `pseudo_out`). `id` values must lie in
+/// `0..n_universe` and be unique within a trait.
+#[no_mangle]
+pub unsafe extern "C" fn genomicsem_ldsc_regressions(
+    l2: *const f64,
+    wld: *const f64,
+    n: *const f64,
+    z: *const f64,
+    a1: *const i32,
+    id: *const i32,
+    complete: *const i32,
+    offsets: *const i32,
+    n_traits: usize,
+    n_universe: usize,
+    pairs_j: *const i32,
+    pairs_k: *const i32,
+    n_pairs: usize,
+    m_tot: f64,
+    n_blocks: usize,
+    requested_threads: usize,
+    reg_tot_out: *mut f64,
+    intercept_out: *mut f64,
+    n_bar_out: *mut f64,
+    n_snps_out: *mut f64,
+    mean_y_out: *mut f64,
+    intercept_se_out: *mut f64,
+    tot_se_out: *mut f64,
+    pseudo_out: *mut f64,
+    status_out: *mut i32,
+) -> i32 {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let offsets = slice::from_raw_parts(offsets, n_traits + 1);
+        let total = offsets[n_traits] as usize;
+        let (l2, wld, n, z) = (
+            slice::from_raw_parts(l2, total),
+            slice::from_raw_parts(wld, total),
+            slice::from_raw_parts(n, total),
+            slice::from_raw_parts(z, total),
+        );
+        let (a1, id, complete) = (
+            slice::from_raw_parts(a1, total),
+            slice::from_raw_parts(id, total),
+            slice::from_raw_parts(complete, total),
+        );
+        let traits: Vec<ldsc::TraitColumns<'_>> = (0..n_traits)
+            .map(|t| {
+                let r = offsets[t] as usize..offsets[t + 1] as usize;
+                ldsc::TraitColumns {
+                    l2: &l2[r.clone()],
+                    wld: &wld[r.clone()],
+                    n: &n[r.clone()],
+                    z: &z[r.clone()],
+                    a1: &a1[r.clone()],
+                    id: &id[r.clone()],
+                    complete: &complete[r],
+                }
+            })
+            .collect();
+        let pj = slice::from_raw_parts(pairs_j, n_pairs);
+        let pk = slice::from_raw_parts(pairs_k, n_pairs);
+        let pairs: Vec<(usize, usize)> = pj.iter().zip(pk).map(|(&j, &k)| (j as usize, k as usize)).collect();
+        ldsc::run(&traits, n_universe, &pairs, m_tot, n_blocks, requested_threads)
+    }));
+    let results = match result {
+        Ok(r) => r,
+        Err(_) => return -1,
+    };
+    let outs = [reg_tot_out, intercept_out, n_bar_out, n_snps_out, mean_y_out, intercept_se_out, tot_se_out];
+    for (p, r) in results.iter().enumerate() {
+        let values = [r.reg_tot, r.intercept, r.n_bar, r.n_snps, r.mean_y, r.intercept_se, r.tot_se];
+        for (o, v) in outs.iter().zip(values) {
+            *o.add(p) = v;
+        }
+        let pseudo = slice::from_raw_parts_mut(pseudo_out.add(p * n_blocks), n_blocks);
+        pseudo.copy_from_slice(&r.pseudo);
+        *status_out.add(p) = r.status;
+    }
+    0
 }
 
 #[cfg(test)]

@@ -1,7 +1,7 @@
-OBJECTS = rust_gls.o init.o
+OBJECTS = rust_gls.o rust_ldsc.o init.o
 
 RUST_MANIFEST = rust/Cargo.toml
-RUST_SOURCES = rust/Cargo.toml rust/Cargo.lock rust/src/lib.rs
+RUST_SOURCES = rust/Cargo.toml rust/Cargo.lock rust/src/lib.rs rust/src/ldsc.rs
 RUST_TARGET_DIR = ../target/rust
 RUST_LIB = $(RUST_TARGET_DIR)/release/libgenomicsem_rust.a
 CARGO = @CARGO@
